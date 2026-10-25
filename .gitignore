@@ -1,0 +1,8 @@
+# Secrets: never commit
+config.json
+
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
