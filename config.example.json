@@ -1,0 +1,16 @@
+{
+  "language": "en",
+  "printer": {
+    "name": "P1S",
+    "ip": "192.168.1.50",
+    "serial": "01P00A000000000",
+    "access_code": "12345678"
+  },
+  "telegram": {
+    "bot_token": "123456789:YOUR-BOT-TOKEN",
+    "chat_id": "123456789"
+  },
+  "notifications": {
+    "first_layer": true
+  }
+}
