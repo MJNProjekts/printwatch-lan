@@ -3,7 +3,7 @@
 Telegram paziņojumi, kameras attēli un attālināta vadība Bambu Lab P1/A1 printeriem **LAN-only režīmā**.
 Bez Bambu mākoņa un bez Home Assistant: dators sazinās ar printeri vietējā tīklā un sūta ziņas uz **tavu** Telegram botu.
 
-> Publiska beta versija (v0.2.2-beta). Pārbaudīts ar **P1S**. Nav saistīts ar Bambu Lab.
+> Publiska beta versija (v0.2.3-beta). Pārbaudīts ar **P1S**. Nav saistīts ar Bambu Lab.
 
 Pilna dokumentācija angliski: [README.md](README.md)
 

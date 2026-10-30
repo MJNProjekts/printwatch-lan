@@ -111,6 +111,14 @@ class TestStateMachine(unittest.TestCase):
         m = st.update({"print": {"gcode_state": "FINISH"}}, end)
         self.assertIn("4 h", m[0])
 
+    def test_start_ignores_remaining_time_of_previous_job(self):
+        st = fresh()
+        st.update({"print": {"gcode_state": "RUNNING", "mc_remaining_time": 150}}, T0)
+        st.update({"print": {"gcode_state": "FAILED"}}, T0)
+        m = st.update({"print": {"gcode_state": "RUNNING", "subtask_name": "short"}}, T0)
+        self.assertNotIn("2 h 30", m[0])
+        self.assertIn("first layer", m[0])
+
     def test_status_hides_targets_when_idle(self):
         st = fresh()
         st.update({"print": {"nozzle_temper": 38, "nozzle_target_temper": 38}}, T0)

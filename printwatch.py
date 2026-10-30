@@ -25,7 +25,7 @@ import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.2.2-beta"
+__version__ = "0.2.3-beta"
 
 # Harmless warnings on macOS system Python (LibreSSL) and paho-mqtt 2.x
 warnings.filterwarnings("ignore", message=".*OpenSSL 1.1.1.*")
@@ -64,6 +64,7 @@ TEXT = {
         "started": "▶️ Print started: {name}",
         "layers": "\nLayers: {n}",
         "preparing_note": "\nPreparing (heating, calibration). Finish time follows with the first layer.",
+        "eta_later_note": "\nFinish time follows with the first layer.",
         "resumed": "▶️ Print resumed: {name} ({progress})",
         "paused": "⏸ PAUSED: {name} ({progress})",
         "error_code": "\nError code: {code}",
@@ -131,6 +132,7 @@ TEXT = {
         "started": "▶️ Druka sākta: {name}",
         "layers": "\nSlāņi: {n}",
         "preparing_note": "\nSagatavo (sildīšana, kalibrēšana). Beigu laiks būs ziņā par pirmo slāni.",
+        "eta_later_note": "\nBeigu laiks būs ziņā par pirmo slāni.",
         "resumed": "▶️ Druka turpināta: {name} ({progress})",
         "paused": "⏸ PAUZE: {name} ({progress})",
         "error_code": "\nKļūdas kods: {code}",
@@ -336,9 +338,11 @@ class PrinterState:
             self.started_at = now
             self.first_layer_sent = False
             self.last_error = 0
-            eta = self.eta(now)
-            if not eta and new == "PREPARE":
-                eta = L("preparing_note")
+            # like the layer count, the remaining time may still be from the previous job:
+            # use it only if it arrived in this same report
+            eta = self.eta(now) if "mc_remaining_time" in p else ""
+            if not eta:
+                eta = L("preparing_note") if new == "PREPARE" else L("eta_later_note")
             # total_layer_num in self.data may still be from the previous job; trust it only
             # when it arrives in this same report (otherwise it is shown in /status later)
             layers = p.get("total_layer_num")

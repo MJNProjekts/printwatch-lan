@@ -4,7 +4,7 @@
 No Bambu cloud, no Home Assistant, no port forwarding. Your computer talks to the printer on your
 local network and sends messages to *your own* Telegram bot.
 
-> **Status: public beta (v0.2.2-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
+> **Status: public beta (v0.2.3-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
 > A1 / A1 mini / P1P use the same protocol and should work, but are untested. X1 series camera is not supported yet.
 > Reports from other models are very welcome.
 

@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.2-beta (2026-10-24)
+## 0.2.3-beta (2026-10-29)
+
+### Fixed
+- "Print started" could show the remaining time of the **previous** (failed or stopped) print,
+  e.g. "2 h 30 min" for a 21-minute job. The finish time now comes with the first-layer message
+  when the start report has no fresh estimate.
+
+## 0.2.2-beta (2026-10-25)
 
 ### Fixed
 - "Print started" message could show the layer count of the **previous** print (the printer sends
@@ -11,11 +18,11 @@
   (code 0300 400C) in two messages. It is now one "⏹ Print cancelled" message.
 - Print durations and finish times are now correct when a print runs across a daylight-saving change.
 
-## 0.2.1-beta (2026-10-25)
+## 0.2.1-beta (2026-10-24)
 - `/photo` could show an old frame: the camera first replays its last buffered frame (it can be hours old, e.g. from the end of the last print). PrintWatch now reads the camera for ~2.5 s and sends the newest frame, and warns if only an old frame was received
 - `/photo` right after `/light` waits a few seconds so the light has really changed
 
-## 0.2.0-beta (2026-10-25)
+## 0.2.0-beta (2026-10-24)
 First public beta.
 - Automatic Telegram messages: print started, first layer done, paused (with error code), resumed, failed, finished, printer offline during a print
 - Commands: `/status`, `/photo`, `/light`, `/pause`, `/resume`, `/stop` + `/confirmstop` (Latvian aliases included)
