@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0-beta (2026-10-31)
+
+### Added
+- **Automatic camera photos during a print**, so problems like spaghetti are noticed in time:
+  - one photo when the first layer is done
+  - prints expected to take over 2 h: a photo every 15 minutes
+  - shorter prints: a photo every 10 % of progress
+  - a photo when the print pauses, fails or finishes
+- `/autophoto` (`/autofoto`) turns automatic photos on or off without restarting.
+- `/status` shows the current auto photo rhythm.
+- Setup asks whether to enable automatic photos (`notifications.auto_photo`, default on).
+- The terminal log shows each command's reply (e.g. whether auto photo is now on or off).
+
 ## 0.2.3-beta (2026-10-29)
 
 ### Fixed

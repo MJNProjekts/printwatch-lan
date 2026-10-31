@@ -199,6 +199,91 @@ class TestCommands(unittest.TestCase):
         self.assertIn("commands", self.h.handle("/xyz")[0].lower())
 
 
+class TestAutoPhoto(unittest.TestCase):
+    def start(self, rem, auto=True):
+        st = fresh()
+        st.auto_photo = auto
+        st.update({"print": {"gcode_state": "PREPARE", "subtask_name": "a"}}, T0)
+        st.update({"print": {"gcode_state": "RUNNING", "layer_num": 1, "mc_percent": 0,
+                             "mc_remaining_time": rem}}, T0)
+        st.update({"print": {"layer_num": 2, "mc_percent": 1, "mc_remaining_time": rem}}, T0)
+        return st
+
+    def take(self, st):
+        n = len(st.photo_queue)
+        st.photo_queue.clear()
+        return n
+
+    def test_short_print_every_10_percent(self):
+        st = self.start(30)
+        self.assertEqual(st.ap_mode, "pct")
+        self.assertEqual(self.take(st), 1)                     # first layer photo
+        st.update({"print": {"mc_percent": 9}}, T0)
+        self.assertEqual(self.take(st), 0)
+        st.update({"print": {"mc_percent": 10}}, T0)
+        self.assertEqual(self.take(st), 1)
+        st.update({"print": {"mc_percent": 15}}, T0)
+        self.assertEqual(self.take(st), 0)
+        st.update({"print": {"mc_percent": 23}}, T0)           # jump over a step: one photo
+        self.assertEqual(self.take(st), 1)
+        st.update({"print": {"mc_percent": 29}}, T0)
+        self.assertEqual(self.take(st), 0)
+        st.update({"print": {"gcode_state": "FINISH", "mc_percent": 100}}, T0)
+        self.assertEqual(self.take(st), 1)                     # finish photo
+
+    def test_long_print_every_15_minutes(self):
+        st = self.start(300)
+        self.assertEqual(st.ap_mode, "time")
+        self.assertEqual(self.take(st), 1)
+        st.update({"print": {"mc_percent": 20}}, T0)
+        self.assertEqual(self.take(st), 0)                     # no % photos for long prints
+        st.tick(T0 + timedelta(minutes=10))
+        self.assertEqual(self.take(st), 0)
+        st.tick(T0 + timedelta(minutes=15))
+        self.assertEqual(self.take(st), 1)
+        st.tick(T0 + timedelta(minutes=25))
+        self.assertEqual(self.take(st), 0)
+        st.tick(T0 + timedelta(minutes=31))
+        self.assertEqual(self.take(st), 1)
+
+    def test_no_photos_while_paused_but_photo_on_pause(self):
+        st = self.start(300)
+        self.take(st)
+        st.update({"print": {"gcode_state": "PAUSE"}}, T0 + timedelta(minutes=5))
+        self.assertEqual(self.take(st), 1)                     # pause photo
+        st.tick(T0 + timedelta(minutes=40))
+        self.assertEqual(self.take(st), 0)
+
+    def test_off(self):
+        st = self.start(30, auto=False)
+        st.update({"print": {"mc_percent": 50}}, T0)
+        st.update({"print": {"gcode_state": "FINISH"}}, T0)
+        self.assertEqual(self.take(st), 0)
+
+    def test_no_photo_before_first_layer(self):
+        st = fresh()
+        st.update({"print": {"gcode_state": "RUNNING", "layer_num": 1, "mc_percent": 0,
+                             "mc_remaining_time": 30}}, T0)
+        self.assertEqual(self.take(st), 0)
+
+    def test_restart_mid_print_sets_rhythm_without_photo(self):
+        st = pw.PrinterState("P1S", pw.Lang("en"))
+        st.connected = True
+        st.update({"print": {"gcode_state": "RUNNING", "layer_num": 30, "mc_percent": 50,
+                             "mc_remaining_time": 200}}, T0)
+        self.assertEqual(st.ap_mode, "time")                   # 400 min total
+        self.assertEqual(self.take(st), 0)
+
+    def test_status_and_toggle_command(self):
+        st = self.start(300)
+        self.assertIn("Auto photo: every 15 min", st.status_text(T0))
+        h = pw.CommandHandler(st, lambda p: True, lambda: b"")
+        self.assertIn("off", h.handle("/autofoto")[0])
+        self.assertEqual(len(st.photo_queue), 0)
+        self.assertIn("Auto photo: off", st.status_text(T0))
+        self.assertIn("every 15 min", h.handle("/autophoto")[0])
+
+
 class TestConfig(unittest.TestCase):
     def test_legacy_format_is_converted(self):
         with tempfile.TemporaryDirectory() as d:

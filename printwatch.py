@@ -16,16 +16,18 @@ License: MIT. See LICENSE.
 """
 
 import json
+import re
 import socket
 import ssl
 import struct
 import sys
 import time
 import warnings
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.2.3-beta"
+__version__ = "0.3.0-beta"
 
 # Harmless warnings on macOS system Python (LibreSSL) and paho-mqtt 2.x
 warnings.filterwarnings("ignore", message=".*OpenSSL 1.1.1.*")
@@ -47,6 +49,9 @@ DONE = {"IDLE", "FINISH", "FAILED"}
 OFFLINE_ALERT_SEC = 5 * 60
 STOP_CONFIRM_SEC = 60
 LIGHT_SETTLE_SEC = 3   # wait after toggling the light before taking a photo
+AUTO_PHOTO_LONG_MIN = 120   # prints expected to take longer get a photo every AUTO_PHOTO_EVERY_MIN
+AUTO_PHOTO_EVERY_MIN = 15
+AUTO_PHOTO_EVERY_PCT = 10   # shorter prints get a photo every N % of progress
 
 # ---------------------------------------------------------------------------
 # Texts (English default, Latvian optional)
@@ -112,14 +117,23 @@ TEXT = {
                  "/status – state, progress, finish time, temperatures\n"
                  "/photo – camera snapshot\n"
                  "/light – toggle the chamber light\n"
+                 "/autophoto – automatic photos during prints on/off\n"
                  "/pause, /resume – pause and resume\n"
                  "/stop – stop the print (confirm with /confirmstop within 60 s)\n\n"
                  "If control commands have no effect, enable Developer mode in the printer's "
                  "LAN settings."),
         "menu": [("status", "Printer status"), ("photo", "Camera snapshot"),
                  ("light", "Toggle light"), ("pause", "Pause print"), ("resume", "Resume print"),
-                 ("stop", "Stop print (asks to confirm)"), ("help", "Commands")],
+                 ("stop", "Stop print (asks to confirm)"),
+                 ("autophoto", "Auto photos on/off"), ("help", "Commands")],
         "cmd_light": "/light", "cmd_stop": "/stop", "cmd_confirm": "/confirmstop",
+        "cmd_auto": "/autophoto",
+        "auto_prefix": "🔁 Auto photo · ",
+        "st_auto": "Auto photo: {v}",
+        "auto_time": "every {m} min", "auto_pct": "every {p}%",
+        "auto_wait": "from the first layer", "auto_state_off": "off",
+        "auto_on": "🔁 Auto photo on: every {m} min for prints over {h} h, every {p}% for shorter ones.",
+        "auto_off": "🔁 Auto photo off. Turn it on again with {cmd}.",
     },
     "lv": {
         "states": {"IDLE": "gaida", "PREPARE": "sagatavo", "RUNNING": "drukā", "PAUSE": "pauzē",
@@ -181,14 +195,22 @@ TEXT = {
                  "/p1s – stāvoklis, progress, beigu laiks, temperatūras\n"
                  "/foto – kameras attēls\n"
                  "/gaisma – ieslēgt / izslēgt gaismu\n"
+                 "/autofoto – automātiskie foto drukas laikā ieslēgt / izslēgt\n"
                  "/pauze, /turpinat – pauze un turpināšana\n"
                  "/stop – apturēt (jāapstiprina ar /stopja 60 s laikā)\n\n"
                  "Ja vadības komandas neiedarbojas, printera LAN iestatījumos ieslēdz Developer mode."),
         "menu": [("p1s", "Printera stāvoklis"), ("foto", "Kameras attēls"),
                  ("gaisma", "Ieslēgt / izslēgt gaismu"), ("pauze", "Pauzēt drukāšanu"),
                  ("turpinat", "Turpināt pēc pauzes"), ("stop", "Apturēt (ar apstiprinājumu)"),
-                 ("help", "Komandu saraksts")],
+                 ("autofoto", "Auto foto ieslēgt / izslēgt"), ("help", "Komandu saraksts")],
         "cmd_light": "/gaisma", "cmd_stop": "/stop", "cmd_confirm": "/stopja",
+        "cmd_auto": "/autofoto",
+        "auto_prefix": "🔁 Auto foto · ",
+        "st_auto": "Auto foto: {v}",
+        "auto_time": "ik {m} min", "auto_pct": "ik {p}%",
+        "auto_wait": "no pirmā slāņa", "auto_state_off": "izslēgts",
+        "auto_on": "🔁 Auto foto ieslēgts: ik {m} min drukām virs {h} h, ik {p}% īsākām.",
+        "auto_off": "🔁 Auto foto izslēgts. Ieslēgt atkal: {cmd}.",
     },
 }
 
@@ -201,6 +223,7 @@ COMMAND_ALIASES = {
     "/resume": "resume", "/turpinat": "resume", "/turpināt": "resume",
     "/stop": "stop",
     "/confirmstop": "confirmstop", "/stopja": "confirmstop",
+    "/autophoto": "autophoto", "/autofoto": "autophoto",
     "/help": "help",
 }
 
@@ -265,7 +288,7 @@ def now_local():
 
 
 class PrinterState:
-    def __init__(self, name="P1S", lang=None, first_layer=True):
+    def __init__(self, name="P1S", lang=None, first_layer=True, auto_photo=True):
         self.printer = name
         self.L = lang or Lang("en")
         self.first_layer = first_layer
@@ -280,6 +303,38 @@ class PrinterState:
         self.offline_alerted = False
         self.remote_pause_at = None   # set when PrintWatch itself sends a pause command
         self.remote_stop_at = None    # set when PrintWatch itself sends a stop command
+        self.auto_photo = auto_photo
+        self.photo_queue = deque()    # auto photo requests, sent by the main loop
+        self.ap_mode = None           # "time" (long print) or "pct" (short print), set at the first layer
+        self.ap_last_at = None
+        self.ap_next_pct = 0
+
+    def request_photo(self):
+        if self.auto_photo:
+            self.photo_queue.append(True)
+
+    def _auto_photo_setup(self, now):
+        """Choose the auto photo rhythm from the expected total print time (at the first layer
+        the printer's estimate is current)."""
+        pct = int(self.data.get("mc_percent") or 0)
+        try:
+            rem = int(self.data.get("mc_remaining_time") or 0)
+        except (TypeError, ValueError):
+            rem = 0
+        total = rem * 100 / (100 - pct) if rem > 0 and pct < 100 else None
+        self.ap_mode = "pct" if total is not None and total <= AUTO_PHOTO_LONG_MIN else "time"
+        self.ap_last_at = now
+        self.ap_next_pct = (pct // AUTO_PHOTO_EVERY_PCT + 1) * AUTO_PHOTO_EVERY_PCT
+
+    def auto_photo_text(self):
+        L = self.L
+        if not self.auto_photo:
+            return L("auto_state_off")
+        if self.ap_mode == "time":
+            return L("auto_time", m=AUTO_PHOTO_EVERY_MIN)
+        if self.ap_mode == "pct":
+            return L("auto_pct", p=AUTO_PHOTO_EVERY_PCT)
+        return L("auto_wait")
 
     def job_name(self):
         n = self.data.get("subtask_name") or self.data.get("gcode_file") or "?"
@@ -328,6 +383,8 @@ class PrinterState:
             if new in ACTIVE:
                 self.started_at = now
                 self.first_layer_sent = int(self.data.get("layer_num") or 0) >= 2
+                if self.first_layer_sent:
+                    self._auto_photo_setup(now)
                 msgs.append(L("greet_active", printer=self.printer, name=self.job_name(),
                               progress=self.progress()) + self.eta(now))
             else:
@@ -338,6 +395,7 @@ class PrinterState:
             self.started_at = now
             self.first_layer_sent = False
             self.last_error = 0
+            self.ap_mode = None
             # like the layer count, the remaining time may still be from the previous job:
             # use it only if it arrived in this same report
             eta = self.eta(now) if "mc_remaining_time" in p else ""
@@ -351,6 +409,7 @@ class PrinterState:
 
         elif new == "RUNNING" and old == "PAUSE":
             msgs.append(L("resumed", name=self.job_name(), progress=self.progress()))
+            self.ap_last_at = now
 
         elif new == "PAUSE" and old != "PAUSE":
             err = int(self.data.get("print_error") or 0)
@@ -368,6 +427,7 @@ class PrinterState:
                 msg += L("pause_no_code")
             self.remote_pause_at = None
             msgs.append(msg)
+            self.request_photo()
 
         elif new == "FAILED" and old != "FAILED":
             err = int(self.data.get("print_error") or 0)
@@ -379,12 +439,14 @@ class PrinterState:
                     msg += L("cancelled_by_bot")
             else:
                 msg = L("failed", name=self.job_name(), progress=self.progress())
+                self.request_photo()
             if err and err != CANCELLED:
                 msg += L("error_code", code=fmt_error(err))
             if self.started_at:
                 msg += L("after", dur=fmt_minutes((now - self.started_at).total_seconds() / 60))
             msgs.append(msg)
             self.started_at = None
+            self.ap_mode = None
 
         elif new == "FINISH" and old in ACTIVE:
             msg = L("finished", name=self.job_name())
@@ -392,11 +454,23 @@ class PrinterState:
                 msg += L("duration", dur=fmt_minutes((now - self.started_at).total_seconds() / 60))
             msgs.append(msg)
             self.started_at = None
+            self.ap_mode = None
+            self.request_photo()
 
         if (new == "RUNNING" and self.first_layer and not self.first_layer_sent
                 and int(self.data.get("layer_num") or 0) >= 2):
             self.first_layer_sent = True
             msgs.append(L("first_layer", name=self.job_name()) + self.eta(now))
+
+        # automatic photos: one at the first layer, then every N min (long print) or N % (short)
+        if new == "RUNNING" and self.ap_mode is None and int(self.data.get("layer_num") or 0) >= 2:
+            self._auto_photo_setup(now)
+            self.request_photo()
+        elif new == "RUNNING" and self.ap_mode == "pct":
+            pct = int(self.data.get("mc_percent") or 0)
+            if self.ap_next_pct <= pct < 100:
+                self.ap_next_pct = (pct // AUTO_PHOTO_EVERY_PCT + 1) * AUTO_PHOTO_EVERY_PCT
+                self.request_photo()
 
         if new == "RUNNING":
             err = int(self.data.get("print_error") or 0)
@@ -424,6 +498,7 @@ class PrinterState:
             if self.started_at:
                 lines.append(L("st_printing_for",
                                dur=fmt_minutes((now - self.started_at).total_seconds() / 60)))
+            lines.append(L("st_auto", v=self.auto_photo_text()))
         for key, cur, tgt in (("st_nozzle", "nozzle_temper", "nozzle_target_temper"),
                               ("st_bed", "bed_temper", "bed_target_temper")):
             if d.get(cur) is not None:
@@ -452,6 +527,10 @@ class PrinterState:
 
     def tick(self, now=None):
         now = now or now_local()
+        if (self.auto_photo and self.connected and self.state == "RUNNING" and self.ap_mode == "time"
+                and (now - self.ap_last_at).total_seconds() >= AUTO_PHOTO_EVERY_MIN * 60):
+            self.ap_last_at = now
+            self.request_photo()
         if (not self.connected and self.disconnected_at and not self.offline_alerted
                 and self.state in ACTIVE
                 and (now - self.disconnected_at).total_seconds() >= OFFLINE_ALERT_SEC):
@@ -569,6 +648,13 @@ class CommandHandler:
                 return L("no_conn"), None
             self.light_changed_at = now_ts
             return L("light_on") if new == "light_on" else L("light_off"), None
+        if cmd == "autophoto":
+            self.st.auto_photo = not self.st.auto_photo
+            if self.st.auto_photo:
+                return L("auto_on", m=AUTO_PHOTO_EVERY_MIN, h=AUTO_PHOTO_LONG_MIN // 60,
+                         p=AUTO_PHOTO_EVERY_PCT), None
+            self.st.photo_queue.clear()
+            return L("auto_off", cmd=L("cmd_auto")), None
         if cmd == "pause":
             if state != "RUNNING":
                 return L("pause_no", state=L.state(state)), None
@@ -741,6 +827,9 @@ def setup(path=CONFIG_PATH):
     fl = ask("Message after the first layer? (y/n)",
              "y" if cfg["notifications"].get("first_layer", True) else "n").lower()
     cfg["notifications"]["first_layer"] = fl.startswith(("y", "j"))
+    ap = ask("Automatic camera photos during prints? (y/n)",
+             "y" if cfg["notifications"].get("auto_photo", True) else "n").lower()
+    cfg["notifications"]["auto_photo"] = ap.startswith(("y", "j"))
 
     cfg.pop("p1s", None)
     save_config(cfg, path)
@@ -769,7 +858,8 @@ def run():
     L = Lang(cfg.get("language", "en"))
     pr, tgc = cfg["printer"], cfg["telegram"]
     serial = pr["serial"]
-    st = PrinterState(pr.get("name", "P1S"), L, cfg.get("notifications", {}).get("first_layer", True))
+    nots = cfg.get("notifications", {})
+    st = PrinterState(pr.get("name", "P1S"), L, nots.get("first_layer", True), nots.get("auto_photo", True))
     bot = Telegram(tgc["bot_token"], tgc["chat_id"])
 
     def send(msgs):
@@ -815,6 +905,21 @@ def run():
 
     handler = CommandHandler(st, publish,
                              lambda: grab_camera_jpeg(pr["ip"], pr["access_code"], with_info=True))
+
+    def send_auto_photo():
+        if not st.photo_queue:
+            return
+        st.photo_queue.clear()   # several requests at the same moment -> one photo
+        try:
+            reply, img = handler.handle("/photo")
+        except Exception as e:
+            reply, img = str(e), None
+        if img:
+            bot.send_photo(img, L("auto_prefix") + reply)
+            print(f"{datetime.now():%H:%M:%S} → auto photo")
+        else:
+            print(f"{datetime.now():%H:%M:%S} auto photo failed: {reply.splitlines()[0] if reply else ''}")
+
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_message = on_message
@@ -824,6 +929,7 @@ def run():
     bot.set_commands(L("menu"))
     offset = bot.skip_old()
     print(f"PrintWatch LAN {__version__} running. Stop with Ctrl + C")
+    print(f"Auto photo: {'on' if st.auto_photo else 'off'} (change with /autophoto)")
     try:
         while True:
             try:
@@ -845,8 +951,10 @@ def run():
                     bot.send_photo(img, reply)
                 else:
                     bot.send(reply)
-                print(f"{datetime.now():%H:%M:%S} command {text.split()[0]}")
+                first = re.sub(r"<[^>]+>", "", reply.splitlines()[0]) if reply else ""
+                print(f"{datetime.now():%H:%M:%S} command {text.split()[0]} → {first}")
             send(st.tick())
+            send_auto_photo()
     except KeyboardInterrupt:
         client.loop_stop()
         client.disconnect()
@@ -871,6 +979,9 @@ def demo(lang="en"):
     for minute, rep in seq:
         for m in st.update(rep, t0 + timedelta(minutes=minute)):
             print(f"--- {t0 + timedelta(minutes=minute):%H:%M}\n{m}")
+        if st.photo_queue:
+            st.photo_queue.clear()
+            print("    [📷 auto photo]")
 
 
 if __name__ == "__main__":

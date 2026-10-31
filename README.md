@@ -4,7 +4,7 @@
 No Bambu cloud, no Home Assistant, no port forwarding. Your computer talks to the printer on your
 local network and sends messages to *your own* Telegram bot.
 
-> **Status: public beta (v0.2.3-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
+> **Status: public beta (v0.3.0-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
 > A1 / A1 mini / P1P use the same protocol and should work, but are untested. X1 series camera is not supported yet.
 > Reports from other models are very welcome.
 
@@ -37,6 +37,7 @@ Only your computer needs internet access. The printer never talks to any cloud.
 | ▶️ | Resumed |
 | ❌ | Failed / stopped, with error code |
 | ✅ | Finished, with total duration |
+| 📷 | Automatic photos: at the first layer, then every 15 min (prints over 2 h) or every 10 % (shorter prints), and on pause, failure and finish |
 | 📡 | Printer unreachable for 5 min *during a print* |
 
 **Commands** (English and Latvian names both work)
@@ -46,6 +47,7 @@ Only your computer needs internet access. The printer never talks to any cloud.
 | `/status` | `/p1s` | State, progress, layer, finish time, temperatures |
 | `/photo` | `/foto` | Camera snapshot |
 | `/light` | `/gaisma` | Toggle the chamber light |
+| `/autophoto` | `/autofoto` | Automatic photos on/off |
 | `/pause` | `/pauze` | Pause the print |
 | `/resume` | `/turpinat` | Resume after pause |
 | `/stop` | `/stop` | Stop the print, **requires** `/confirmstop` (`/stopja`) within 60 s |
