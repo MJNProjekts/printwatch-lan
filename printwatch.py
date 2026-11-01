@@ -10,11 +10,19 @@ Usage:
   python printwatch.py --setup     guided setup (printer + Telegram bot)
   python printwatch.py             run the monitor
   python printwatch.py --demo      print example messages without a printer
+  python printwatch.py --files     list the printer's SD card (timelapse videos) over FTPS
+  python printwatch.py --dump      save one full printer report to printer_dump.json
+                                   (private fields removed), e.g. for bug reports
   python printwatch.py --version
 
 License: MIT. See LICENSE.
 """
 
+import ftplib
+import io
+import shutil
+import subprocess
+import tempfile
 import json
 import re
 import socket
@@ -27,7 +35,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.3.0-beta"
+__version__ = "0.3.1-beta"
 
 # Harmless warnings on macOS system Python (LibreSSL) and paho-mqtt 2.x
 warnings.filterwarnings("ignore", message=".*OpenSSL 1.1.1.*")
@@ -52,6 +60,13 @@ LIGHT_SETTLE_SEC = 3   # wait after toggling the light before taking a photo
 AUTO_PHOTO_LONG_MIN = 120   # prints expected to take longer get a photo every AUTO_PHOTO_EVERY_MIN
 AUTO_PHOTO_EVERY_MIN = 15
 AUTO_PHOTO_EVERY_PCT = 10   # shorter prints get a photo every N % of progress
+SPEED_NAMES = {1: "Silent", 2: "Standard", 3: "Sport", 4: "Ludicrous"}   # Bambu speed levels (spd_lvl)
+SPEED_PCT = {1: 50, 2: 100, 3: 124, 4: 166}
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024   # Telegram bots can send files up to 50 MB
+CONVERT_MAX = 300 * 1024 * 1024      # with MP4 conversion, bigger AVIs are fine (MP4 is ~3x smaller)
+VIDEO_EXT = (".avi", ".mp4", ".mov")
+SPEED_WORDS = {"silent": 1, "klusais": 1, "standard": 2, "standarts": 2, "sport": 3, "sports": 3,
+               "ludicrous": 4, "trakais": 4}
 
 # ---------------------------------------------------------------------------
 # Texts (English default, Latvian optional)
@@ -118,6 +133,8 @@ TEXT = {
                  "/photo – camera snapshot\n"
                  "/light – toggle the chamber light\n"
                  "/autophoto – automatic photos during prints on/off\n"
+                 "/speed – print speed (/speed 1–4)\n"
+                 "/timelapse – last timelapse video, /timelapses – list\n"
                  "/pause, /resume – pause and resume\n"
                  "/stop – stop the print (confirm with /confirmstop within 60 s)\n\n"
                  "If control commands have no effect, enable Developer mode in the printer's "
@@ -125,9 +142,35 @@ TEXT = {
         "menu": [("status", "Printer status"), ("photo", "Camera snapshot"),
                  ("light", "Toggle light"), ("pause", "Pause print"), ("resume", "Resume print"),
                  ("stop", "Stop print (asks to confirm)"),
+                 ("speed", "Print speed"), ("timelapse", "Last timelapse video"),
                  ("autophoto", "Auto photos on/off"), ("help", "Commands")],
         "cmd_light": "/light", "cmd_stop": "/stop", "cmd_confirm": "/confirmstop",
-        "cmd_auto": "/autophoto",
+        "cmd_auto": "/autophoto", "cmd_speed": "/speed", "cmd_tl": "/timelapse", "cmd_tls": "/timelapses",
+        "tl_busy": "The newest timelapse may still be recording: it is completed when the print ends. "
+                   "Older videos can be downloaded now: {cmd}",
+        "tl_none": "🎞 No timelapse videos on the SD card. Tick Timelapse when sending a print "
+                   "in Bambu Studio (an SD card is required).",
+        "tl_list_title": "🎞 Timelapse videos on the SD card (newest first):",
+        "tl_bad": "Unknown video number. See the list: {cmd}",
+        "tl_too_big": "🎞 {name} is {mb}, over Telegram's 50 MB limit for bots. Copy it from the SD card instead.",
+        "tl_downloading": "🎞 Downloading {name} ({mb}) from the printer...",
+        "tl_caption": "🎞 Timelapse: {name}",
+        "tl_caption_n": "🎞 Timelapse #{n} from the SD card",
+        "tl_newest": "newest",
+        "tl_clock_note": "(Video file names use the printer's own clock, which is not synced in LAN-only mode.)",
+        "tl_fail": "🎞 Could not read the SD card: {err}\nCheck that an SD card is inserted. "
+                   "Some firmware needs Developer mode for file access in LAN-only mode.",
+        "st_speed": "Speed: {v}", "st_filament": "Filament: {v}", "st_wifi": "Wi-Fi: {v}",
+        "st_timelapse": "Timelapse: {v}", "st_no_sd": " (⚠️ no SD card)",
+        "st_ams": "AMS: {v}", "ams_none": "not connected", "ams_one": "connected",
+        "ams_many": "connected ({n} units)",
+        "speed_now": "⚡ Speed: {v}", "speed_unknown": "unknown",
+        "speed_help": "\nChange during a print:\n{cmd}1 – Silent (50%)\n{cmd}2 – Standard (100%)\n"
+                      "{cmd}3 – Sport (124%)\n{cmd}4 – Ludicrous (166%)",
+        "speed_no": "Speed can be changed only during a print (printer is {state}).",
+        "speed_bad": "Unknown speed. Use {cmd}1, {cmd}2, {cmd}3 or {cmd}4.",
+        "speed_sent": "⚡ Speed command sent: {v}. The printer confirms in a moment.",
+        "speed_changed": "⚡ Speed changed: {v}",
         "auto_prefix": "🔁 Auto photo · ",
         "st_auto": "Auto photo: {v}",
         "auto_time": "every {m} min", "auto_pct": "every {p}%",
@@ -196,15 +239,43 @@ TEXT = {
                  "/foto – kameras attēls\n"
                  "/gaisma – ieslēgt / izslēgt gaismu\n"
                  "/autofoto – automātiskie foto drukas laikā ieslēgt / izslēgt\n"
+                 "/atrums – drukas ātrums (/atrums 1–4)\n"
+                 "/video – pēdējais timelapse video, /videos – saraksts\n"
                  "/pauze, /turpinat – pauze un turpināšana\n"
                  "/stop – apturēt (jāapstiprina ar /stopja 60 s laikā)\n\n"
                  "Ja vadības komandas neiedarbojas, printera LAN iestatījumos ieslēdz Developer mode."),
         "menu": [("p1s", "Printera stāvoklis"), ("foto", "Kameras attēls"),
                  ("gaisma", "Ieslēgt / izslēgt gaismu"), ("pauze", "Pauzēt drukāšanu"),
                  ("turpinat", "Turpināt pēc pauzes"), ("stop", "Apturēt (ar apstiprinājumu)"),
-                 ("autofoto", "Auto foto ieslēgt / izslēgt"), ("help", "Komandu saraksts")],
+                 ("atrums", "Drukas ātrums"), ("video", "Pēdējais timelapse video"), ("autofoto", "Auto foto ieslēgt / izslēgt"),
+                 ("help", "Komandu saraksts")],
         "cmd_light": "/gaisma", "cmd_stop": "/stop", "cmd_confirm": "/stopja",
-        "cmd_auto": "/autofoto",
+        "cmd_auto": "/autofoto", "cmd_speed": "/atrums", "cmd_tl": "/video", "cmd_tls": "/videos",
+        "tl_busy": "Jaunākais timelapse, iespējams, vēl tiek ierakstīts: tas tiek pabeigts drukas beigās. "
+                   "Vecākos video var lejupielādēt jau tagad: {cmd}",
+        "tl_none": "🎞 SD kartē nav timelapse video. Bambu Studio, sūtot druku, atzīmē Timelapse "
+                   "(vajadzīga SD karte).",
+        "tl_list_title": "🎞 Timelapse video SD kartē (jaunākie pirmie):",
+        "tl_bad": "Nezināms video numurs. Saraksts: {cmd}",
+        "tl_too_big": "🎞 {name} ir {mb}, vairāk par Telegram 50 MB limitu botiem. Kopē to no SD kartes.",
+        "tl_downloading": "🎞 Lejupielādēju {name} ({mb}) no printera...",
+        "tl_caption": "🎞 Timelapse: {name}",
+        "tl_caption_n": "🎞 Timelapse #{n} no SD kartes",
+        "tl_newest": "jaunākais",
+        "tl_clock_note": "(Video nosaukumos ir printera iekšējais laiks, kas LAN-only režīmā netiek sinhronizēts.)",
+        "tl_fail": "🎞 Neizdevās nolasīt SD karti: {err}\nPārbaudi, vai SD karte ir ielikta. "
+                   "Dažām firmware versijām LAN režīmā failu piekļuvei vajag Developer mode.",
+        "st_speed": "Ātrums: {v}", "st_filament": "Filaments: {v}", "st_wifi": "Wi-Fi: {v}",
+        "st_timelapse": "Timelapse: {v}", "st_no_sd": " (⚠️ nav SD kartes)",
+        "st_ams": "AMS: {v}", "ams_none": "nav pieslēgts", "ams_one": "pieslēgts",
+        "ams_many": "pieslēgti {n} bloki",
+        "speed_now": "⚡ Ātrums: {v}", "speed_unknown": "nav zināms",
+        "speed_help": "\nMainīt drukas laikā:\n{cmd}1 – Silent (50%)\n{cmd}2 – Standard (100%)\n"
+                      "{cmd}3 – Sport (124%)\n{cmd}4 – Ludicrous (166%)",
+        "speed_no": "Ātrumu var mainīt tikai drukas laikā (printeris {state}).",
+        "speed_bad": "Nezināms ātrums. Izmanto {cmd}1, {cmd}2, {cmd}3 vai {cmd}4.",
+        "speed_sent": "⚡ Ātruma komanda nosūtīta: {v}. Printeris apstiprinās pēc brīža.",
+        "speed_changed": "⚡ Ātrums mainīts: {v}",
         "auto_prefix": "🔁 Auto foto · ",
         "st_auto": "Auto foto: {v}",
         "auto_time": "ik {m} min", "auto_pct": "ik {p}%",
@@ -224,6 +295,9 @@ COMMAND_ALIASES = {
     "/stop": "stop",
     "/confirmstop": "confirmstop", "/stopja": "confirmstop",
     "/autophoto": "autophoto", "/autofoto": "autophoto",
+    "/speed": "speed", "/atrums": "speed", "/ātrums": "speed",
+    "/timelapse": "timelapse", "/video": "timelapse",
+    "/timelapses": "timelapses", "/videos": "timelapses",
     "/help": "help",
 }
 
@@ -271,6 +345,27 @@ def fmt_hms(hms):
     return out
 
 
+def speed_label(lvl):
+    return f"{SPEED_NAMES[lvl]} ({SPEED_PCT[lvl]}%)"
+
+
+def parse_speed(arg):
+    """'3', 'sport', '124', '124%' -> 3; None if unknown."""
+    a = str(arg).strip().lower().rstrip("%")
+    if a in SPEED_WORDS:
+        return SPEED_WORDS[a]
+    try:
+        n = int(a)
+    except ValueError:
+        return None
+    if n in SPEED_NAMES:
+        return n
+    for lvl, pct in SPEED_PCT.items():
+        if n == pct:
+            return lvl
+    return None
+
+
 def light_state(data):
     for node in data.get("lights_report") or []:
         if isinstance(node, dict) and node.get("node") == "chamber_light":
@@ -303,6 +398,7 @@ class PrinterState:
         self.offline_alerted = False
         self.remote_pause_at = None   # set when PrintWatch itself sends a pause command
         self.remote_stop_at = None    # set when PrintWatch itself sends a stop command
+        self.print_had_timelapse = False   # timelapse was on during the last print (seen by PrintWatch)
         self.auto_photo = auto_photo
         self.photo_queue = deque()    # auto photo requests, sent by the main loop
         self.ap_mode = None           # "time" (long print) or "pct" (short print), set at the first layer
@@ -325,6 +421,34 @@ class PrinterState:
         self.ap_mode = "pct" if total is not None and total <= AUTO_PHOTO_LONG_MIN else "time"
         self.ap_last_at = now
         self.ap_next_pct = (pct // AUTO_PHOTO_EVERY_PCT + 1) * AUTO_PHOTO_EVERY_PCT
+
+    def speed_text(self):
+        try:
+            lvl = int(self.data.get("spd_lvl"))
+        except (TypeError, ValueError):
+            return None
+        return speed_label(lvl) if lvl in SPEED_NAMES else None
+
+    def ams_count(self):
+        """Number of connected AMS units, or None if the printer has not reported it."""
+        ams = self.data.get("ams")
+        if not isinstance(ams, dict):
+            return None
+        bits = ams.get("ams_exist_bits")
+        if bits not in (None, ""):
+            try:
+                return bin(int(str(bits), 16)).count("1")
+            except ValueError:
+                pass
+        units = ams.get("ams")
+        return len(units) if isinstance(units, list) else None
+
+    def filament_text(self):
+        tray_now = (self.data.get("ams") or {}).get("tray_now")
+        vt = self.data.get("vt_tray")
+        if tray_now in (None, "254") and isinstance(vt, dict) and vt.get("tray_type"):
+            return vt["tray_type"]   # external spool (no AMS in use)
+        return None
 
     def auto_photo_text(self):
         L = self.L
@@ -371,6 +495,7 @@ class PrinterState:
         p = report.get("print") or {}
         if not p:
             return msgs
+        old_spd = self.data.get("spd_lvl")
         self.data.update(p)
         new = self.data.get("gcode_state")
         if not new:
@@ -381,7 +506,7 @@ class PrinterState:
             self.greeted = True
             self.state = new
             if new in ACTIVE:
-                self.started_at = now
+                self.started_at = None   # real start time unknown after a restart mid-print
                 self.first_layer_sent = int(self.data.get("layer_num") or 0) >= 2
                 if self.first_layer_sent:
                     self._auto_photo_setup(now)
@@ -396,6 +521,7 @@ class PrinterState:
             self.first_layer_sent = False
             self.last_error = 0
             self.ap_mode = None
+            self.print_had_timelapse = False
             # like the layer count, the remaining time may still be from the previous job:
             # use it only if it arrived in this same report
             eta = self.eta(now) if "mc_remaining_time" in p else ""
@@ -478,6 +604,14 @@ class PrinterState:
                 self.last_error = err
                 msgs.append(L("error_running", code=fmt_error(err), name=self.job_name()))
 
+        ipcam = self.data.get("ipcam")
+        if new in ACTIVE and isinstance(ipcam, dict) and ipcam.get("timelapse") == "enable":
+            self.print_had_timelapse = True
+
+        if ("spd_lvl" in p and old_spd is not None and str(p["spd_lvl"]) != str(old_spd)
+                and new in ACTIVE and old in ACTIVE and self.speed_text()):
+            msgs.append(L("speed_changed", v=self.speed_text()))
+
         self.state = new
         return msgs
 
@@ -498,6 +632,8 @@ class PrinterState:
             if self.started_at:
                 lines.append(L("st_printing_for",
                                dur=fmt_minutes((now - self.started_at).total_seconds() / 60)))
+            if self.speed_text():
+                lines.append(L("st_speed", v=self.speed_text()))
             lines.append(L("st_auto", v=self.auto_photo_text()))
         for key, cur, tgt in (("st_nozzle", "nozzle_temper", "nozzle_target_temper"),
                               ("st_bed", "bed_temper", "bed_target_temper")):
@@ -506,6 +642,20 @@ class PrinterState:
                 if d.get(tgt) and state in ACTIVE:
                     line += L("st_target", t=float(d[tgt]))
                 lines.append(line)
+        tl = (d.get("ipcam") or {}).get("timelapse") if isinstance(d.get("ipcam"), dict) else None
+        if tl in ("enable", "disable"):
+            line = L("st_timelapse", v=L("on") if tl == "enable" else L("off"))
+            if tl == "enable" and d.get("sdcard") is False:
+                line += L("st_no_sd")
+            lines.append(line)
+        n_ams = self.ams_count()
+        if n_ams is not None:
+            v = L("ams_none") if n_ams == 0 else L("ams_one") if n_ams == 1 else L("ams_many", n=n_ams)
+            lines.append(L("st_ams", v=v))
+        if self.filament_text():
+            lines.append(L("st_filament", v=self.filament_text()))
+        if d.get("wifi_signal"):
+            lines.append(L("st_wifi", v=d["wifi_signal"]))
         light = light_state(d)
         if light:
             lines.append(L("st_light", v=L("on") if light == "on" else L("off")))
@@ -544,8 +694,10 @@ class PrinterState:
 # Printer commands and camera
 # ---------------------------------------------------------------------------
 
-def mqtt_command(kind):
+def mqtt_command(kind, param=None):
     seq = str(int(time.time()))
+    if kind == "speed":
+        return {"print": {"sequence_id": seq, "command": "print_speed", "param": str(int(param))}}
     if kind in ("pause", "resume", "stop"):
         return {"print": {"sequence_id": seq, "command": kind, "param": ""}}
     if kind in ("light_on", "light_off"):
@@ -606,20 +758,222 @@ def grab_camera_jpeg(ip, access_code, timeout=12, settle=2.5, max_frames=10, wit
     return (frames[-1], fresh) if with_info else frames[-1]
 
 
-class CommandHandler:
-    """Telegram command logic. handle() returns (text, jpeg_or_None)."""
+def find_ffmpeg():
+    """Path to ffmpeg: from the system, or from the optional imageio-ffmpeg package."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
-    def __init__(self, state, publish, grab_photo):
+
+def avi_to_mp4(data, ffmpeg, timeout=300):
+    """Bambu P1/A1 timelapses are MJPEG .avi, which macOS and Telegram can't play.
+    Returns H.264 .mp4 bytes, or None if conversion fails."""
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = Path(d) / "in.avi", Path(d) / "out.mp4"
+        src.write_bytes(data)
+        try:
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(dst)],
+                           check=True, timeout=timeout, capture_output=True)
+            out = dst.read_bytes()
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return out or None
+
+
+def fmt_mb(size):
+    return f"{size / 1048576:.1f} MB" if size else "? MB"
+
+
+def pick_videos(names):
+    """Video file names, newest first (Bambu names them video_YYYY-MM-DD_HH-MM-SS)."""
+    out = {str(n).rsplit("/", 1)[-1] for n in names}
+    return sorted((n for n in out if n.lower().endswith(VIDEO_EXT)), reverse=True)
+
+
+class ImplicitFTPS(ftplib.FTP_TLS):
+    """FTP over implicit TLS (port 990), as used by Bambu Lab printers in LAN mode.
+    The data connection reuses the control connection's TLS session, which the printer requires."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sock = None
+
+    @property
+    def sock(self):
+        return self._sock
+
+    @sock.setter
+    def sock(self, value):
+        if value is not None and not isinstance(value, ssl.SSLSocket):
+            value = self.context.wrap_socket(value)
+        self._sock = value
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn, server_hostname=self.host, session=self.sock.session)
+        return conn, size
+
+
+class PrinterFiles:
+    """Read-only access to the printer's SD card over FTPS (user bblp, password = access code)."""
+
+    def __init__(self, ip, access_code, timeout=30):
+        self.ip, self.code, self.timeout = ip, access_code, timeout
+
+    def _open(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE   # printer uses a self-signed certificate
+        ftp = ImplicitFTPS(context=ctx, timeout=self.timeout)
+        ftp.connect(self.ip, 990)
+        ftp.login("bblp", self.code)
+        ftp.prot_p()
+        ftp.voidcmd("TYPE I")
+        return ftp
+
+    @staticmethod
+    def _names(ftp, path):
+        try:
+            names = ftp.nlst(path)
+        except ftplib.error_perm:
+            names = []
+        if not names:                      # some servers answer only LIST
+            lines = []
+            try:
+                ftp.retrlines(f"LIST {path}", lines.append)
+            except ftplib.error_perm:
+                return []
+            names = [ln.split(None, 8)[-1] for ln in lines if ln.strip() and len(ln.split()) >= 9]
+        return names
+
+    @staticmethod
+    def _size(ftp, path):
+        try:
+            ftp.voidcmd("TYPE I")   # listing switches to ASCII, where servers refuse SIZE
+            return ftp.size(path)
+        except ftplib.all_errors:
+            return None
+
+    def list_videos(self):
+        """[(name, size_bytes_or_None)], newest first."""
+        ftp = self._open()
+        try:
+            items = [(n, self._size(ftp, f"/timelapse/{n}"))
+                     for n in pick_videos(self._names(ftp, "/timelapse"))]
+            return [(n, sz) for n, sz in items if sz != 0]   # skip empty files (interrupted prints)
+        finally:
+            try:
+                ftp.quit()
+            except ftplib.all_errors:
+                pass
+
+    def get_video(self, name):
+        ftp = self._open()
+        buf = io.BytesIO()
+        try:
+            ftp.retrbinary(f"RETR /timelapse/{name}", buf.write)
+        finally:
+            try:
+                ftp.quit()
+            except ftplib.all_errors:
+                pass
+        return buf.getvalue()
+
+    def root(self):
+        ftp = self._open()
+        try:
+            return sorted(n.rsplit("/", 1)[-1] for n in self._names(ftp, "/"))
+        finally:
+            try:
+                ftp.quit()
+            except ftplib.all_errors:
+                pass
+
+
+class CommandHandler:
+    """Telegram command logic. handle() returns (text, attachment): attachment is None,
+    JPEG bytes (photo) or {"document": bytes, "filename": str} (video file)."""
+
+    def __init__(self, state, publish, grab_photo, files=None):
         self.st = state
         self.publish = publish          # publish(dict) -> bool
         self.grab_photo = grab_photo    # grab_photo() -> bytes
+        self.files = files              # PrinterFiles-like: list_videos(), get_video(name)
+        self.notify = lambda text: None # sends an interim message (e.g. "downloading...")
+        self.convert = None             # convert(avi_bytes) -> mp4 bytes or None
         self.stop_pending_until = 0.0
         self.light_changed_at = 0.0
         self.sleep = time.sleep
 
+    def timelapse(self, text, cmd, state):
+        L = self.st.L
+        if self.files is None:
+            return L("tl_fail", err="no access"), None
+        parts = text.split()
+        arg = "list" if cmd == "timelapses" else (parts[1] if len(parts) > 1 else "1")
+        try:
+            items = self.files.list_videos()
+        except Exception as e:
+            return L("tl_fail", err=e), None
+        if not items:
+            return L("tl_none"), None
+        if arg == "list":
+            lines = [L("tl_list_title")]
+            for i, (n, sz) in enumerate(items[:5], 1):
+                label = f"{L('tl_newest')} · {fmt_mb(sz)}" if i == 1 else fmt_mb(sz)
+                lines.append(f"{L('cmd_tl')}{i} – {label}")
+            lines.append(L("tl_clock_note"))
+            return "\n".join(lines), None
+        try:
+            idx = int(arg)
+        except ValueError:
+            idx = 0
+        if not 1 <= idx <= len(items):
+            return L("tl_bad", cmd=L("cmd_tls")), None
+        if idx == 1 and state in ACTIVE:   # the newest video may be the one being recorded now
+            return L("tl_busy", cmd=L("cmd_tls")), None
+        name, size = items[idx - 1]
+        limit = CONVERT_MAX if self.convert else TG_UPLOAD_LIMIT
+        if size and size > limit:
+            return L("tl_too_big", name=name, mb=fmt_mb(size)), None
+        self.notify(L("tl_downloading", name=name, mb=fmt_mb(size)))
+        try:
+            data = self.files.get_video(name)
+        except Exception as e:
+            return L("tl_fail", err=e), None
+        if not data:
+            return L("tl_fail", err="empty file"), None
+        job = self.st.job_name()
+        if idx == 1 and job != "?" and self.st.print_had_timelapse:
+            caption = L("tl_caption", name=job)
+        else:
+            caption = L("tl_caption_n", n=idx)
+        if self.convert and name.lower().endswith(".avi"):
+            mp4 = self.convert(data)
+            if mp4 and len(mp4) <= TG_UPLOAD_LIMIT:
+                return caption, {"video": mp4, "filename": name[:-4] + ".mp4"}
+        if len(data) > TG_UPLOAD_LIMIT:
+            return L("tl_too_big", name=name, mb=fmt_mb(len(data))), None
+        return caption, {"document": data, "filename": name}
+
     def handle(self, text, now_ts=None):
         now_ts = now_ts or time.time()
         L = self.st.L
+        # "/speed3" (tappable in Telegram) is the same as "/speed 3"
+        m = re.match(r"^(/(?:speed|atrums|ātrums))([1-4])(@\S+)?(\s|$)", text.strip(), re.IGNORECASE)
+        if m:
+            text = f"{m.group(1)} {m.group(2)}"
+        m = re.match(r"^(/(?:timelapse|video))(\d+)(@\S+)?(\s|$)", text.strip(), re.IGNORECASE)
+        if m:
+            text = f"{m.group(1)} {m.group(2)}"
         cmd = COMMAND_ALIASES.get(text.strip().split()[0].split("@")[0].lower(), "help")
         state = self.st.data.get("gcode_state")
 
@@ -648,6 +1002,21 @@ class CommandHandler:
                 return L("no_conn"), None
             self.light_changed_at = now_ts
             return L("light_on") if new == "light_on" else L("light_off"), None
+        if cmd in ("timelapse", "timelapses"):
+            return self.timelapse(text, cmd, state)
+        if cmd == "speed":
+            parts = text.split()
+            if len(parts) < 2:
+                cur = self.st.speed_text() or L("speed_unknown")
+                return L("speed_now", v=cur) + L("speed_help", cmd=L("cmd_speed")), None
+            lvl = parse_speed(parts[1])
+            if lvl is None:
+                return L("speed_bad", cmd=L("cmd_speed")), None
+            if state not in ACTIVE:
+                return L("speed_no", state=L.state(state)), None
+            if not self.publish(mqtt_command("speed", lvl)):
+                return L("no_conn"), None
+            return L("speed_sent", v=speed_label(lvl)), None
         if cmd == "autophoto":
             self.st.auto_photo = not self.st.auto_photo
             if self.st.auto_photo:
@@ -711,6 +1080,31 @@ class Telegram:
             return r.ok
         except requests.RequestException as e:
             print(f"Telegram photo error: {e}")
+            return False
+
+    def send_video(self, data, filename, caption=""):
+        try:
+            r = requests.post(f"{self.base}/sendVideo",
+                              data={"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML",
+                                    "supports_streaming": "true"},
+                              files={"video": (filename, data, "video/mp4")}, timeout=300)
+            if not r.ok:
+                print(f"Telegram error {r.status_code}: {r.text[:200]}")
+            return r.ok
+        except requests.RequestException as e:
+            print(f"Telegram video error: {e}")
+            return False
+
+    def send_document(self, data, filename, caption=""):
+        try:
+            r = requests.post(f"{self.base}/sendDocument",
+                              data={"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML"},
+                              files={"document": (filename, data, "application/octet-stream")}, timeout=300)
+            if not r.ok:
+                print(f"Telegram error {r.status_code}: {r.text[:200]}")
+            return r.ok
+        except requests.RequestException as e:
+            print(f"Telegram file error: {e}")
             return False
 
     def set_commands(self, menu):
@@ -846,8 +1240,6 @@ def setup(path=CONFIG_PATH):
 # ---------------------------------------------------------------------------
 
 def run():
-    import paho.mqtt.client as mqtt
-
     cfg = load_config()
     missing = config_problems(cfg)
     if missing:
@@ -867,13 +1259,7 @@ def run():
             print(f"{datetime.now():%H:%M:%S} → {m.splitlines()[0]}")
             bot.send(m)
 
-    try:  # paho-mqtt 2.x
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"printwatch-{int(time.time())}")
-    except AttributeError:  # paho-mqtt 1.x
-        client = mqtt.Client(client_id=f"printwatch-{int(time.time())}")
-    client.username_pw_set("bblp", pr["access_code"])
-    client.tls_set(cert_reqs=ssl.CERT_NONE)  # printer uses a self-signed certificate
-    client.tls_insecure_set(True)
+    client = make_mqtt_client(pr)
     client.reconnect_delay_set(min_delay=5, max_delay=120)
 
     def on_connect(c, userdata, flags, rc):
@@ -904,7 +1290,12 @@ def run():
         return client.publish(f"device/{serial}/request", json.dumps(payload)).rc == 0
 
     handler = CommandHandler(st, publish,
-                             lambda: grab_camera_jpeg(pr["ip"], pr["access_code"], with_info=True))
+                             lambda: grab_camera_jpeg(pr["ip"], pr["access_code"], with_info=True),
+                             PrinterFiles(pr["ip"], pr["access_code"]))
+    handler.notify = bot.send
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        handler.convert = lambda data: avi_to_mp4(data, ffmpeg)
 
     def send_auto_photo():
         if not st.photo_queue:
@@ -930,6 +1321,8 @@ def run():
     offset = bot.skip_old()
     print(f"PrintWatch LAN {__version__} running. Stop with Ctrl + C")
     print(f"Auto photo: {'on' if st.auto_photo else 'off'} (change with /autophoto)")
+    print("Timelapse videos: sent as MP4" if ffmpeg else
+          "Timelapse videos: sent as .avi (for playable MP4:  pip install imageio-ffmpeg)")
     try:
         while True:
             try:
@@ -947,7 +1340,12 @@ def run():
                     reply, img = handler.handle(text)
                 except Exception as e:
                     reply, img = f"Error: {e}", None
-                if img:
+                if isinstance(img, dict) and "video" in img:
+                    if not bot.send_video(img["video"], img["filename"], reply):
+                        bot.send_document(img["video"], img["filename"], reply)
+                elif isinstance(img, dict):
+                    bot.send_document(img["document"], img["filename"], reply)
+                elif img:
                     bot.send_photo(img, reply)
                 else:
                     bot.send(reply)
@@ -958,6 +1356,132 @@ def run():
     except KeyboardInterrupt:
         client.loop_stop()
         client.disconnect()
+
+
+def make_mqtt_client(pr):
+    import paho.mqtt.client as mqtt
+    try:  # paho-mqtt 2.x
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"printwatch-{int(time.time())}")
+    except AttributeError:  # paho-mqtt 1.x
+        client = mqtt.Client(client_id=f"printwatch-{int(time.time())}")
+    client.username_pw_set("bblp", pr["access_code"])
+    client.tls_set(cert_reqs=ssl.CERT_NONE)  # printer uses a self-signed certificate
+    client.tls_insecure_set(True)
+    return client
+
+
+# ---------------------------------------------------------------------------
+# --dump: one full printer report, for bug reports and new features
+# ---------------------------------------------------------------------------
+
+PRIVATE_KEYS = {"ip", "mask", "gateway", "net", "sn", "serial", "dev_id", "ssid", "rtsp_url",
+                "tag_uid", "tray_uuid"}
+
+
+def redact(obj, secrets=()):
+    """Copy of a printer report with private fields (network, serial numbers) removed."""
+    secrets = [str(x) for x in secrets if x]
+    if isinstance(obj, dict):
+        return {k: "<removed>" if str(k).lower() in PRIVATE_KEYS else redact(v, secrets)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(v, secrets) for v in obj]
+    if isinstance(obj, str):
+        for x in secrets:
+            obj = obj.replace(x, "<removed>")
+    return obj
+
+
+def dump(path=None, max_wait=20):
+    cfg = load_config()
+    missing = [m for m in config_problems(cfg) if m.startswith("printer.")]
+    if missing:
+        print("Configuration incomplete:", ", ".join(missing))
+        print("Run:  python printwatch.py --setup")
+        sys.exit(1)
+    pr = cfg["printer"]
+    serial = pr["serial"]
+    out = Path(path) if path else CONFIG_PATH.with_name("printer_dump.json")
+    got = {}
+
+    def on_connect(c, userdata, flags, rc):
+        if rc != 0:
+            print(f"Connection refused (rc={rc}). Check the access code and serial number.")
+            return
+        c.subscribe(f"device/{serial}/report")
+        c.publish(f"device/{serial}/request",
+                  json.dumps({"pushing": {"sequence_id": "0", "command": "pushall"}}))
+        c.publish(f"device/{serial}/request",
+                  json.dumps({"info": {"sequence_id": "0", "command": "get_version"}}))
+
+    def on_message(c, userdata, msg):
+        try:
+            report = json.loads(msg.payload.decode("utf-8", errors="ignore"))
+        except ValueError:
+            return
+        for k, v in report.items():
+            if isinstance(v, dict) and isinstance(got.get(k), dict):
+                got[k].update(v)
+            else:
+                got[k] = v
+
+    client = make_mqtt_client(pr)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    print(f"Connecting to the printer and reading its full report (up to {max_wait} s)...")
+    try:
+        client.connect(pr["ip"], 8883, keepalive=30)
+    except OSError as e:
+        print(f"Could not reach the printer: {e}")
+        sys.exit(1)
+    client.loop_start()
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        if "gcode_state" in got.get("print", {}) and "info" in got:
+            break
+        time.sleep(0.5)
+    time.sleep(2)   # a moment for late parts of the report
+    client.loop_stop()
+    client.disconnect()
+
+    if not got.get("print"):
+        print("No report received. Is the printer on and in LAN-only mode?")
+        sys.exit(1)
+    data = {"printwatch_version": __version__,
+            "created": now_local().isoformat(timespec="seconds"),
+            "note": "PrintWatch LAN --dump. Private fields are replaced with <removed>."}
+    data.update(redact(got, [serial, pr["ip"], pr.get("access_code")]))
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
+    keys = sorted(got["print"])
+    print(f"Saved {out.name}: {len(keys)} fields in the printer report.")
+    print("Fields:", ", ".join(keys))
+    print("Private fields were removed, but please look through the file before sharing it.")
+
+
+def files_cli():
+    cfg = load_config()
+    missing = [m for m in config_problems(cfg) if m.startswith("printer.")]
+    if missing:
+        print("Configuration incomplete:", ", ".join(missing))
+        sys.exit(1)
+    pr = cfg["printer"]
+    pf = PrinterFiles(pr["ip"], pr["access_code"])
+    print("Connecting to the printer's SD card over FTPS (port 990)...")
+    try:
+        root = pf.root()
+        videos = pf.list_videos()
+    except Exception as e:
+        print(f"Could not read the SD card: {e}")
+        print("Check that an SD card is inserted. Some firmware needs Developer mode for file access.")
+        sys.exit(1)
+    print("SD card:", ", ".join(root) if root else "(empty)")
+    if videos:
+        print(f"Timelapse videos ({len(videos)}, newest first):")
+        for n, sz in videos[:10]:
+            print(f"  {n}  {fmt_mb(sz)}")
+    else:
+        print("No timelapse videos. Tick Timelapse when sending a print in Bambu Studio.")
 
 
 def demo(lang="en"):
@@ -989,6 +1513,10 @@ if __name__ == "__main__":
         print(__version__)
     elif "--demo" in sys.argv:
         demo("lv" if "lv" in sys.argv else "en")
+    elif "--files" in sys.argv:
+        files_cli()
+    elif "--dump" in sys.argv:
+        dump()
     elif "--setup" in sys.argv:
         setup()
     else:

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.1-beta (2026-11-01)
+
+### Added
+- **Timelapse videos from the SD card in LAN-only mode**, which Bambu Studio and Handy can't show:
+  - `/timelapse` (`/video`) sends the newest video, `/timelapses` (`/videos`) lists the last 5
+    (tap `/timelapse2` etc.). Files are read over FTPS (port 990).
+  - Bambu's MJPEG `.avi` (which macOS and Telegram can't play) is converted to MP4 and sent as a
+    playable video, about 3x smaller. Needs ffmpeg (`imageio-ffmpeg`, now in `requirements.txt`);
+    without it the `.avi` is sent as a file. Telegram allows bots files up to 50 MB.
+  - During a print only the newest video (possibly still recording) is held back.
+  - The printer's clock is not synced in LAN-only mode, so file name dates are not shown; the newest
+    video is labelled with the print name.
+- `/speed` (`/atrums`) shows the print speed and changes it during a print:
+  `/speed1` Silent (50%), `/speed2` Standard (100%), `/speed3` Sport (124%), `/speed4` Ludicrous (166%).
+  `/speed 3`, `/speed sport` and `/speed 124` work too.
+- A message when the speed changes during a print (from the bot or the printer screen).
+- `/status` shows speed, timelapse on/off (with a warning if there is no SD card), whether an AMS
+  is connected, filament type (external spool) and Wi-Fi signal.
+- `python printwatch.py --files` lists the SD card and timelapse videos in the terminal.
+- `python printwatch.py --dump` saves one full printer report to `printer_dump.json` with private
+  fields (IP, network, serial numbers) removed, for bug reports and new features.
+- README: "Help wanted" section for AMS owners and other printer models.
+
+### Fixed
+- After restarting the monitor in the middle of a print, `/status` showed "Printing for" and the
+  finish message showed "Duration" counted from the restart. They are now left out when the real
+  start time is unknown.
+
 ## 0.3.0-beta (2026-10-31)
 
 ### Added

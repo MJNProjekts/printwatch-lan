@@ -1,8 +1,13 @@
 # Secrets: never commit
 config.json
+printer_dump.json
 
 venv/
 .venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Printer videos (tests, downloads)
+*.avi
+*.mp4

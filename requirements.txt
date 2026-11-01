@@ -1,2 +1,4 @@
 requests>=2.25
 paho-mqtt>=1.6
+# optional: converts timelapse .avi to playable MP4 (bundles ffmpeg)
+imageio-ffmpeg>=0.4

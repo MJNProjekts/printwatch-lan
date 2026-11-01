@@ -4,7 +4,7 @@
 No Bambu cloud, no Home Assistant, no port forwarding. Your computer talks to the printer on your
 local network and sends messages to *your own* Telegram bot.
 
-> **Status: public beta (v0.3.0-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
+> **Status: public beta (v0.3.1-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
 > A1 / A1 mini / P1P use the same protocol and should work, but are untested. X1 series camera is not supported yet.
 > Reports from other models are very welcome.
 
@@ -40,6 +40,8 @@ Only your computer needs internet access. The printer never talks to any cloud.
 | 📷 | Automatic photos: at the first layer, then every 15 min (prints over 2 h) or every 10 % (shorter prints), and on pause, failure and finish |
 | 📡 | Printer unreachable for 5 min *during a print* |
 
+**Timelapse in LAN-only mode:** Bambu Studio can't browse the SD card in LAN-only mode, but PrintWatch can. Tick *Timelapse* when sending a print (SD card required), then send `/timelapse` after the print. Bambu records MJPEG `.avi`, which macOS and Telegram can't play, so PrintWatch converts it to MP4 (installed with `requirements.txt` via `imageio-ffmpeg`). `python printwatch.py --files` lists the card in the terminal.
+
 **Commands** (English and Latvian names both work)
 
 | Command | Latvian | What it does |
@@ -48,6 +50,8 @@ Only your computer needs internet access. The printer never talks to any cloud.
 | `/photo` | `/foto` | Camera snapshot |
 | `/light` | `/gaisma` | Toggle the chamber light |
 | `/autophoto` | `/autofoto` | Automatic photos on/off |
+| `/timelapse` | `/video` | Newest timelapse video from the SD card (`/timelapses` lists the last 5) |
+| `/speed` | `/atrums` | Show print speed; `/speed 1`–`4` changes it (Silent / Standard / Sport / Ludicrous) |
 | `/pause` | `/pauze` | Pause the print |
 | `/resume` | `/turpinat` | Resume after pause |
 | `/stop` | `/stop` | Stop the print, **requires** `/confirmstop` (`/stopja`) within 60 s |
@@ -60,8 +64,11 @@ Example:
 File: bracket_PETG
 Progress: 29%, layer 4/25
 Remaining: 42 min → done ~18:05
+Speed: Standard (100%)
 Nozzle: 250°C (target 250°C)
 Bed: 70°C (target 70°C)
+Filament: PETG
+Wi-Fi: -57dBm
 Light: on
 ```
 
@@ -153,6 +160,7 @@ Restarting the monitor in the middle of a print is safe: it reports the current 
 | Connected, but no Telegram message | Wrong token or chat ID, or you haven't pressed **Start** in the bot |
 | `/photo` fails | Check that the printer camera is enabled; only P1/A1 series are supported |
 | `/light`, `/pause`, `/stop` have no effect | Newer firmware may require **Developer mode** in the LAN-only settings for third-party control |
+| Need to report a bug or check what your printer sends | `python printwatch.py --dump` saves one full printer report to `printer_dump.json` with private fields removed. Look through it before sharing |
 | Another program uses the same bot | Two programs can't read commands from the same bot. Use a separate bot for PrintWatch |
 
 ## Development
@@ -163,8 +171,22 @@ python -m unittest discover -s tests -v
 
 The printer logic (`PrinterState`, `CommandHandler`) is pure Python and fully testable without a printer.
 
+## Help wanted: AMS owners and other models
+
+PrintWatch is developed on a P1S **without AMS**. It already shows whether an AMS is connected,
+but AMS features (slot overview with filament type, colour and remaining %, low-filament warning)
+need real data from AMS users.
+
+If you have an **AMS / AMS lite**, or an **A1 / A1 mini / P1P**, you can help in 2 minutes:
+
+1. Run `python printwatch.py --dump` while the printer is on (ideally during a print).
+2. Open `printer_dump.json` and check it. IP, network and serial numbers are already removed.
+3. Open an [issue](https://github.com/MJNProjekts/printwatch-lan/issues) titled
+   "Dump: <your model> + AMS", attach the file and tell what you would like the bot to show.
+
 ## Roadmap
 
+- [ ] AMS: slot overview and low-filament warning (needs data from AMS users, see above)
 - [ ] Multiple printers in one bot
 - [ ] Inline buttons instead of typed commands
 - [ ] Browser-based setup page and automatic printer discovery
