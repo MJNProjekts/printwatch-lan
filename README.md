@@ -4,7 +4,7 @@
 No Bambu cloud, no Home Assistant, no port forwarding. Your computer talks to the printer on your
 local network and sends messages to *your own* Telegram bot.
 
-> **Status: public beta (v0.3.1-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
+> **Status: public beta (v0.4.0-beta).** Tested on a Bambu Lab **P1S** in LAN-only mode.
 > A1 / A1 mini / P1P use the same protocol and should work, but are untested. X1 series camera is not supported yet.
 > Reports from other models are very welcome.
 
@@ -55,6 +55,7 @@ Only your computer needs internet access. The printer never talks to any cloud.
 | `/pause` | `/pauze` | Pause the print |
 | `/resume` | `/turpinat` | Resume after pause |
 | `/stop` | `/stop` | Stop the print, **requires** `/confirmstop` (`/stopja`) within 60 s |
+| `/viewers` | `/skatitaji` | View-only users: list and remove |
 | `/help` | `/help` | Command list |
 
 Example:
@@ -71,6 +72,28 @@ Filament: PETG
 Wi-Fi: -57dBm
 Light: on
 ```
+
+## View-only users (family, friends, a group)
+
+Let other people follow your prints without giving them control. A view-only user:
+
+- gets the automatic messages (started, first layer, paused, failed, finished, offline), **but not the automatic photos**
+- can use `/status`, `/photo`, `/timelapse` and `/timelapses`
+- can **never** use `/light`, `/pause`, `/resume`, `/stop`, `/speed`, `/autophoto` or `/viewers`
+
+How to add someone (no IDs to type, nothing to edit):
+
+1. The person opens your bot in Telegram and presses **Start**. They get "This is a private bot, your request has been sent".
+2. You get `👤 Access request: Anna (@anna)` with a command like `/allow1`. Tap it.
+3. Anna gets a welcome message with her commands.
+
+`/viewers` lists everyone with a tap-to-remove command (`/remove1`). Up to 10 viewers.
+A **Telegram group** works too: add the bot to the group, send `/start@YourBot` there and allow the request;
+everyone in the group can then look. Viewers are stored in `viewers.json` next to the script (not in
+`config.json`, listed in `.gitignore`). To turn off access requests completely, set
+`"viewer_requests": false` in the `telegram` section of `config.json`.
+
+A viewer can't switch the light, so when it is off, a viewer's `/photo` switches it on for the snapshot and off again (at most once per 2 minutes). This is the only thing a viewer can do to the printer. To turn it off: `"viewer_light_photo": false` in the `telegram` section.
 
 ## Requirements
 
@@ -144,7 +167,7 @@ Restarting the monitor in the middle of a print is safe: it reports the current 
 
 ## Security
 
-- The bot **only answers your own chat ID** and ignores everyone else, because it can pause and stop the printer.
+- Only **your own chat ID** can control the printer. View-only users you allowed can look, never control. Everyone else gets no printer data at all; their first message only sends you an access request.
 - `/stop` always requires a second confirmation.
 - `config.json` contains your access code and bot token **in plain text**. It is listed in `.gitignore`; never share or commit it.
 - The printer uses a self-signed certificate, so TLS certificate verification is disabled for the

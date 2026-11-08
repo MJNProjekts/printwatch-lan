@@ -1,6 +1,7 @@
 # Secrets: never commit
 config.json
 printer_dump.json
+viewers.json
 
 venv/
 .venv/

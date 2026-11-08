@@ -23,6 +23,7 @@ import io
 import shutil
 import subprocess
 import tempfile
+import html
 import json
 import re
 import socket
@@ -35,7 +36,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.3.1-beta"
+__version__ = "0.4.0-beta"
 
 # Harmless warnings on macOS system Python (LibreSSL) and paho-mqtt 2.x
 warnings.filterwarnings("ignore", message=".*OpenSSL 1.1.1.*")
@@ -51,12 +52,14 @@ except (AttributeError, ValueError):
     pass
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
+VIEWERS_PATH = Path(__file__).with_name("viewers.json")   # view-only users, managed from Telegram
 ACTIVE = {"PREPARE", "RUNNING", "PAUSE"}
 CANCELLED = 0x0300400C   # Bambu print_error code for "print was cancelled" (stop from screen, app or bot)
 DONE = {"IDLE", "FINISH", "FAILED"}
 OFFLINE_ALERT_SEC = 5 * 60
 STOP_CONFIRM_SEC = 60
 LIGHT_SETTLE_SEC = 3   # wait after toggling the light before taking a photo
+VIEWER_LIGHT_COOLDOWN = 120   # a viewer's /photo may switch the light on at most once per 2 min
 AUTO_PHOTO_LONG_MIN = 120   # prints expected to take longer get a photo every AUTO_PHOTO_EVERY_MIN
 AUTO_PHOTO_EVERY_MIN = 15
 AUTO_PHOTO_EVERY_PCT = 10   # shorter prints get a photo every N % of progress
@@ -65,6 +68,10 @@ SPEED_PCT = {1: 50, 2: 100, 3: 124, 4: 166}
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024   # Telegram bots can send files up to 50 MB
 CONVERT_MAX = 300 * 1024 * 1024      # with MP4 conversion, bigger AVIs are fine (MP4 is ~3x smaller)
 VIDEO_EXT = (".avi", ".mp4", ".mov")
+MAX_VIEWERS = 10
+MAX_PENDING_REQUESTS = 20
+# what a view-only user may do: look, never control the printer
+VIEWER_COMMANDS = {"status", "photo", "timelapse", "timelapses", "help"}
 SPEED_WORDS = {"silent": 1, "klusais": 1, "standard": 2, "standarts": 2, "sport": 3, "sports": 3,
                "ludicrous": 4, "trakais": 4}
 
@@ -136,14 +143,16 @@ TEXT = {
                  "/speed – print speed (/speed 1–4)\n"
                  "/timelapse – last timelapse video, /timelapses – list\n"
                  "/pause, /resume – pause and resume\n"
-                 "/stop – stop the print (confirm with /confirmstop within 60 s)\n\n"
+                 "/stop – stop the print (confirm with /confirmstop within 60 s)\n"
+                 "/viewers – view-only users\n\n"
                  "If control commands have no effect, enable Developer mode in the printer's "
                  "LAN settings."),
         "menu": [("status", "Printer status"), ("photo", "Camera snapshot"),
                  ("light", "Toggle light"), ("pause", "Pause print"), ("resume", "Resume print"),
                  ("stop", "Stop print (asks to confirm)"),
                  ("speed", "Print speed"), ("timelapse", "Last timelapse video"),
-                 ("autophoto", "Auto photos on/off"), ("help", "Commands")],
+                 ("autophoto", "Auto photos on/off"), ("viewers", "View-only users"),
+                 ("help", "Commands")],
         "cmd_light": "/light", "cmd_stop": "/stop", "cmd_confirm": "/confirmstop",
         "cmd_auto": "/autophoto", "cmd_speed": "/speed", "cmd_tl": "/timelapse", "cmd_tls": "/timelapses",
         "tl_busy": "The newest timelapse may still be recording: it is completed when the print ends. "
@@ -177,6 +186,32 @@ TEXT = {
         "auto_wait": "from the first layer", "auto_state_off": "off",
         "auto_on": "🔁 Auto photo on: every {m} min for prints over {h} h, every {p}% for shorter ones.",
         "auto_off": "🔁 Auto photo off. Turn it on again with {cmd}.",
+        "photo_dark_viewer": "\n(light is off, image may be dark)",
+        "photo_lit_viewer": "\n(light switched on for this photo, then off again)",
+        "photo_light_wait": "\n(next photo with light in {s} s)",
+        "viewer_help": ("<b>PrintWatch LAN (view only)</b>\n"
+                        "/status – state, progress, finish time\n"
+                        "/photo – camera snapshot\n"
+                        "/timelapse – last timelapse video, /timelapses – list\n\n"
+                        "You also get a message when a print starts, finishes or needs attention."),
+        "viewer_menu": [("status", "Printer status"), ("photo", "Camera snapshot"),
+                        ("timelapse", "Last timelapse video"), ("timelapses", "Timelapse list"),
+                        ("help", "Commands")],
+        "viewer_denied": "🔒 View-only access: only the printer owner can use this command.",
+        "req_user": "🔒 This is a private PrintWatch bot. Your request has been sent to the owner.",
+        "req_admin": "👤 Access request: {who}\nAllow view only (status, photo, timelapse, messages): {cmd}{n}",
+        "allow_bad": "Unknown request number. New requests arrive here when someone presses Start in the bot.",
+        "allow_full": "Already {n} viewers, that is the maximum. Remove one first: {cmd}",
+        "allow_done": "✅ {who} can now watch {printer} (view only).",
+        "viewer_welcome": "👋 You can now watch {printer} (view only).\n\n",
+        "remove_bad": "Unknown viewer number. See the list: {cmd}",
+        "remove_done": "🗑 {who} can no longer watch {printer}.",
+        "viewer_removed": "🔒 Your access to {printer} has been removed.",
+        "viewers_title": "👥 <b>View-only users</b> (status, photo, timelapse, messages):",
+        "viewers_line": "{n}. {who} – remove: {cmd}{n}",
+        "viewers_none": ("👥 No view-only users yet.\nTo add one: the person opens the bot in Telegram and "
+                         "presses Start. You then get a request here with a tap-to-allow command."),
+        "cmd_allow": "/allow", "cmd_remove": "/remove", "cmd_viewers": "/viewers",
     },
     "lv": {
         "states": {"IDLE": "gaida", "PREPARE": "sagatavo", "RUNNING": "drukā", "PAUSE": "pauzē",
@@ -242,13 +277,14 @@ TEXT = {
                  "/atrums – drukas ātrums (/atrums 1–4)\n"
                  "/video – pēdējais timelapse video, /videos – saraksts\n"
                  "/pauze, /turpinat – pauze un turpināšana\n"
-                 "/stop – apturēt (jāapstiprina ar /stopja 60 s laikā)\n\n"
+                 "/stop – apturēt (jāapstiprina ar /stopja 60 s laikā)\n"
+                 "/skatitaji – lietotāji ar skatīšanās tiesībām\n\n"
                  "Ja vadības komandas neiedarbojas, printera LAN iestatījumos ieslēdz Developer mode."),
         "menu": [("p1s", "Printera stāvoklis"), ("foto", "Kameras attēls"),
                  ("gaisma", "Ieslēgt / izslēgt gaismu"), ("pauze", "Pauzēt drukāšanu"),
                  ("turpinat", "Turpināt pēc pauzes"), ("stop", "Apturēt (ar apstiprinājumu)"),
                  ("atrums", "Drukas ātrums"), ("video", "Pēdējais timelapse video"), ("autofoto", "Auto foto ieslēgt / izslēgt"),
-                 ("help", "Komandu saraksts")],
+                 ("skatitaji", "Skatītāji (tikai skatīties)"), ("help", "Komandu saraksts")],
         "cmd_light": "/gaisma", "cmd_stop": "/stop", "cmd_confirm": "/stopja",
         "cmd_auto": "/autofoto", "cmd_speed": "/atrums", "cmd_tl": "/video", "cmd_tls": "/videos",
         "tl_busy": "Jaunākais timelapse, iespējams, vēl tiek ierakstīts: tas tiek pabeigts drukas beigās. "
@@ -282,6 +318,32 @@ TEXT = {
         "auto_wait": "no pirmā slāņa", "auto_state_off": "izslēgts",
         "auto_on": "🔁 Auto foto ieslēgts: ik {m} min drukām virs {h} h, ik {p}% īsākām.",
         "auto_off": "🔁 Auto foto izslēgts. Ieslēgt atkal: {cmd}.",
+        "photo_dark_viewer": "\n(gaisma izslēgta, attēls var būt tumšs)",
+        "photo_lit_viewer": "\n(gaisma uz brīdi ieslēgta šim foto un atkal izslēgta)",
+        "photo_light_wait": "\n(nākamais foto ar gaismu pēc {s} s)",
+        "viewer_help": ("<b>PrintWatch LAN (tikai skatīšanās)</b>\n"
+                        "/p1s – stāvoklis, progress, beigu laiks\n"
+                        "/foto – kameras attēls\n"
+                        "/video – pēdējais timelapse video, /videos – saraksts\n\n"
+                        "Ziņu saņemsi arī, kad druka sākas, beidzas vai vajag uzmanību."),
+        "viewer_menu": [("p1s", "Printera stāvoklis"), ("foto", "Kameras attēls"),
+                        ("video", "Pēdējais timelapse video"), ("videos", "Timelapse saraksts"),
+                        ("help", "Komandu saraksts")],
+        "viewer_denied": "🔒 Tikai skatīšanās tiesības: šo komandu var lietot tikai printera īpašnieks.",
+        "req_user": "🔒 Šis ir privāts PrintWatch bots. Tavs pieprasījums nosūtīts īpašniekam.",
+        "req_admin": "👤 Piekļuves pieprasījums: {who}\nAtļaut tikai skatīties (stāvoklis, foto, timelapse, ziņas): {cmd}{n}",
+        "allow_bad": "Nezināms pieprasījuma numurs. Pieprasījumi atnāk šeit, kad kāds botā nospiež Start.",
+        "allow_full": "Jau ir {n} skatītāji, tas ir maksimums. Vispirms noņem kādu: {cmd}",
+        "allow_done": "✅ {who} tagad var skatīties {printer} (tikai skatīšanās).",
+        "viewer_welcome": "👋 Tagad vari skatīties {printer} (tikai skatīšanās).\n\n",
+        "remove_bad": "Nezināms skatītāja numurs. Saraksts: {cmd}",
+        "remove_done": "🗑 {who} vairs nevar skatīties {printer}.",
+        "viewer_removed": "🔒 Tava piekļuve {printer} ir noņemta.",
+        "viewers_title": "👥 <b>Skatītāji</b> (stāvoklis, foto, timelapse, ziņas):",
+        "viewers_line": "{n}. {who} – noņemt: {cmd}{n}",
+        "viewers_none": ("👥 Skatītāju vēl nav.\nKā pievienot: cilvēks Telegram atver botu un nospiež Start. "
+                         "Tad šeit atnāks pieprasījums ar komandu, ko vienkārši pieskarties."),
+        "cmd_allow": "/atlaut", "cmd_remove": "/nonemt", "cmd_viewers": "/skatitaji",
     },
 }
 
@@ -298,6 +360,9 @@ COMMAND_ALIASES = {
     "/speed": "speed", "/atrums": "speed", "/ātrums": "speed",
     "/timelapse": "timelapse", "/video": "timelapse",
     "/timelapses": "timelapses", "/videos": "timelapses",
+    "/viewers": "viewers", "/skatitaji": "viewers", "/skatītāji": "viewers",
+    "/allow": "allow", "/atlaut": "allow", "/atļaut": "allow",
+    "/remove": "remove", "/nonemt": "remove", "/noņemt": "remove",
     "/help": "help",
 }
 
@@ -615,7 +680,7 @@ class PrinterState:
         self.state = new
         return msgs
 
-    def status_text(self, now=None):
+    def status_text(self, now=None, viewer=False):
         now = now or now_local()
         L, d = self.L, self.data
         if not self.connected and not d:
@@ -634,7 +699,8 @@ class PrinterState:
                                dur=fmt_minutes((now - self.started_at).total_seconds() / 60)))
             if self.speed_text():
                 lines.append(L("st_speed", v=self.speed_text()))
-            lines.append(L("st_auto", v=self.auto_photo_text()))
+            if not viewer:   # auto photos go to the owner only
+                lines.append(L("st_auto", v=self.auto_photo_text()))
         for key, cur, tgt in (("st_nozzle", "nozzle_temper", "nozzle_target_temper"),
                               ("st_bed", "bed_temper", "bed_target_temper")):
             if d.get(cur) is not None:
@@ -898,6 +964,91 @@ class PrinterFiles:
                 pass
 
 
+def chat_label(chat):
+    """Readable, HTML-safe name for a Telegram chat: 'Anna (@anna)' or a group title."""
+    name = " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x) or chat.get("title") or "?"
+    if chat.get("username"):
+        name += f" (@{chat['username']})"
+    if chat.get("type") in ("group", "supergroup"):
+        name += " [group]"
+    return html.escape(name)
+
+
+class Viewers:
+    """View-only Telegram chats: they get the automatic messages and may use /status, /photo and
+    /timelapse, but can never control the printer. The owner (config chat_id) adds them from
+    Telegram: the person presses Start in the bot, the owner taps /allowN.
+    Stored in viewers.json next to the script, so config.json is never rewritten."""
+
+    def __init__(self, admin_id, path=None):
+        self.admin = str(admin_id)
+        self.path = path
+        self.items = []          # [{"id": "123", "name": "Anna (@anna)"}]
+        self.pending = {}        # request number -> {"id", "name"}
+        self.requested = set()   # chat ids that already asked during this run (no spam to the owner)
+        self.next_n = 1
+        self.load()
+
+    def load(self):
+        if not self.path or not Path(self.path).exists():
+            return
+        try:
+            raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
+            self.items = [{"id": str(v["id"]), "name": str(v.get("name", ""))}
+                          for v in raw.get("viewers", []) if str(v.get("id", "")) not in ("", self.admin)]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+            print(f"Could not read {Path(self.path).name}: {e}")
+
+    def save(self):
+        if self.path:
+            Path(self.path).write_text(json.dumps({"viewers": self.items}, indent=2, ensure_ascii=False),
+                                       encoding="utf-8")
+
+    def ids(self):
+        return [v["id"] for v in self.items]
+
+    def role(self, chat_id):
+        cid = str(chat_id)
+        if cid == self.admin:
+            return "admin"
+        return "viewer" if cid in self.ids() else None
+
+    def request(self, chat):
+        """An unknown chat wrote to the bot. Returns the message for the owner, or None
+        if this chat already asked during this run (or too many requests are open)."""
+        cid = str(chat.get("id", ""))
+        if not cid or cid == self.admin or cid in self.ids() or cid in self.requested:
+            return None
+        if len(self.pending) >= MAX_PENDING_REQUESTS:
+            return None
+        self.requested.add(cid)
+        n = self.next_n
+        self.next_n += 1
+        self.pending[n] = {"id": cid, "name": chat_label(chat)}
+        return n
+
+    def allow(self, n):
+        """Returns the added viewer, 'full', or None for an unknown request number."""
+        v = self.pending.get(n)
+        if not v:
+            return None
+        if v["id"] not in self.ids() and len(self.items) >= MAX_VIEWERS:
+            return "full"
+        self.pending.pop(n)
+        if v["id"] not in self.ids():
+            self.items.append(v)
+            self.save()
+        return v
+
+    def remove(self, n):
+        if not 1 <= n <= len(self.items):
+            return None
+        v = self.items.pop(n - 1)
+        self.requested.discard(v["id"])   # may ask again later
+        self.save()
+        return v
+
+
 class CommandHandler:
     """Telegram command logic. handle() returns (text, attachment): attachment is None,
     JPEG bytes (photo) or {"document": bytes, "filename": str} (video file)."""
@@ -908,9 +1059,13 @@ class CommandHandler:
         self.grab_photo = grab_photo    # grab_photo() -> bytes
         self.files = files              # PrinterFiles-like: list_videos(), get_video(name)
         self.notify = lambda text: None # sends an interim message (e.g. "downloading...")
+        self.viewers = None             # Viewers, or None when view-only users are not used
+        self.send_to = lambda chat_id, text: None   # message to another chat (viewer welcome)
         self.convert = None             # convert(avi_bytes) -> mp4 bytes or None
         self.stop_pending_until = 0.0
         self.light_changed_at = 0.0
+        self.viewer_light = False       # viewer /photo may switch the light on briefly (enabled in run())
+        self.viewer_light_at = -VIEWER_LIGHT_COOLDOWN
         self.sleep = time.sleep
 
     def timelapse(self, text, cmd, state):
@@ -964,7 +1119,36 @@ class CommandHandler:
             return L("tl_too_big", name=name, mb=fmt_mb(len(data))), None
         return caption, {"document": data, "filename": name}
 
-    def handle(self, text, now_ts=None):
+    def manage_viewers(self, cmd, text):
+        L = self.st.L
+        vw = self.viewers
+        if vw is None:
+            return L("help")
+        m = re.search(r"(\d+)", text.split()[0] + " " + " ".join(text.split()[1:2]))
+        n = int(m.group(1)) if m else 0
+        if cmd == "allow":
+            v = vw.allow(n)
+            if v is None:
+                return L("allow_bad")
+            if v == "full":
+                return L("allow_full", n=MAX_VIEWERS, cmd=L("cmd_viewers"))
+            self.send_to(v["id"], L("viewer_welcome", printer=self.st.printer) + L("viewer_help"))
+            return L("allow_done", who=v["name"], printer=self.st.printer)
+        if cmd == "remove":
+            v = vw.remove(n)
+            if v is None:
+                return L("remove_bad", cmd=L("cmd_viewers"))
+            self.send_to(v["id"], L("viewer_removed", printer=self.st.printer))
+            return L("remove_done", who=v["name"], printer=self.st.printer)
+        if not vw.items:
+            return L("viewers_none")
+        lines = [L("viewers_title")]
+        for i, v in enumerate(vw.items, 1):
+            lines.append(L("viewers_line", n=i, who=v["name"], cmd=L("cmd_remove")))
+        return "\n".join(lines)
+
+    def handle(self, text, now_ts=None, role="admin"):
+        """role: "admin" (config chat_id, full control) or "viewer" (look only)."""
         now_ts = now_ts or time.time()
         L = self.st.L
         # "/speed3" (tappable in Telegram) is the same as "/speed 3"
@@ -974,12 +1158,37 @@ class CommandHandler:
         m = re.match(r"^(/(?:timelapse|video))(\d+)(@\S+)?(\s|$)", text.strip(), re.IGNORECASE)
         if m:
             text = f"{m.group(1)} {m.group(2)}"
-        cmd = COMMAND_ALIASES.get(text.strip().split()[0].split("@")[0].lower(), "help")
+        m = re.match(r"^(/(?:allow|atlaut|atļaut|remove|nonemt|noņemt))(\d+)(@\S+)?(\s|$)", text.strip(),
+                     re.IGNORECASE)
+        if m:
+            text = f"{m.group(1)} {m.group(2)}"
+        word = text.strip().split()[0].split("@")[0].lower().rstrip(".,!?;:")   # "/viewers," -> "/viewers"
+        cmd = COMMAND_ALIASES.get(word, "help")
         state = self.st.data.get("gcode_state")
+        viewer = role != "admin"
+
+        if viewer:   # never let a view-only user reach a control command
+            if cmd == "help":
+                return L("viewer_help"), None
+            if cmd not in VIEWER_COMMANDS:
+                return L("viewer_denied"), None
+        if cmd in ("viewers", "allow", "remove"):
+            return self.manage_viewers(cmd, text), None
 
         if cmd == "status":
-            return self.st.status_text(), None
+            return self.st.status_text(viewer=viewer), None
         if cmd == "photo":
+            # A viewer can't use /light, so a viewer's photo may switch the light on for the snapshot
+            # and off again. Rate-limited, because it is the one thing a viewer can do to the printer.
+            lit, light_wait = False, 0
+            if viewer and self.viewer_light and light_state(self.st.data) == "off":
+                left = self.viewer_light_at + VIEWER_LIGHT_COOLDOWN - now_ts
+                if left > 0:
+                    light_wait = int(left) + 1
+                elif self.publish(mqtt_command("light_on")):
+                    lit = True
+                    self.viewer_light_at = self.light_changed_at = now_ts
+                    print(f"{datetime.now():%H:%M:%S} viewer photo: light on for the snapshot")
             wait = self.light_changed_at + LIGHT_SETTLE_SEC - now_ts
             if wait > 0:
                 self.sleep(wait)    # let the light really change before the snapshot
@@ -987,12 +1196,20 @@ class CommandHandler:
                 res = self.grab_photo()
             except Exception as e:
                 return L("photo_fail", err=e), None
+            finally:
+                if lit:
+                    self.publish(mqtt_command("light_off"))   # always restore the previous state
+                    self.light_changed_at = now_ts + LIGHT_SETTLE_SEC
             img, fresh = res if isinstance(res, tuple) else (res, True)
             cap = L("photo_caption", state=L.state(state))
             if state in ACTIVE:
                 cap += f" · {self.st.job_name()} ({self.st.progress()})"
-            if light_state(self.st.data) == "off":
-                cap += L("photo_dark", cmd=L("cmd_light"))
+            if lit:
+                cap += L("photo_lit_viewer")
+            elif light_state(self.st.data) == "off":
+                cap += L("photo_dark_viewer") if viewer else L("photo_dark", cmd=L("cmd_light"))
+                if light_wait:
+                    cap += L("photo_light_wait", s=light_wait)
             if not fresh:
                 cap += L("photo_stale")
             return cap, img
@@ -1060,10 +1277,10 @@ class Telegram:
         self.base = f"https://api.telegram.org/bot{token}"
         self.chat_id = str(chat_id)
 
-    def send(self, text):
+    def send(self, text, chat_id=None):
         try:
             r = requests.post(f"{self.base}/sendMessage",
-                              data={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
+                              data={"chat_id": chat_id or self.chat_id, "text": text, "parse_mode": "HTML"},
                               timeout=15)
             if not r.ok:
                 print(f"Telegram error {r.status_code}: {r.text[:200]}")
@@ -1072,20 +1289,20 @@ class Telegram:
             print(f"Telegram connection error: {e}")
             return False
 
-    def send_photo(self, jpeg, caption=""):
+    def send_photo(self, jpeg, caption="", chat_id=None):
         try:
             r = requests.post(f"{self.base}/sendPhoto",
-                              data={"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML"},
+                              data={"chat_id": chat_id or self.chat_id, "caption": caption, "parse_mode": "HTML"},
                               files={"photo": ("printer.jpg", jpeg, "image/jpeg")}, timeout=30)
             return r.ok
         except requests.RequestException as e:
             print(f"Telegram photo error: {e}")
             return False
 
-    def send_video(self, data, filename, caption=""):
+    def send_video(self, data, filename, caption="", chat_id=None):
         try:
             r = requests.post(f"{self.base}/sendVideo",
-                              data={"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML",
+                              data={"chat_id": chat_id or self.chat_id, "caption": caption, "parse_mode": "HTML",
                                     "supports_streaming": "true"},
                               files={"video": (filename, data, "video/mp4")}, timeout=300)
             if not r.ok:
@@ -1095,10 +1312,10 @@ class Telegram:
             print(f"Telegram video error: {e}")
             return False
 
-    def send_document(self, data, filename, caption=""):
+    def send_document(self, data, filename, caption="", chat_id=None):
         try:
             r = requests.post(f"{self.base}/sendDocument",
-                              data={"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML"},
+                              data={"chat_id": chat_id or self.chat_id, "caption": caption, "parse_mode": "HTML"},
                               files={"document": (filename, data, "application/octet-stream")}, timeout=300)
             if not r.ok:
                 print(f"Telegram error {r.status_code}: {r.text[:200]}")
@@ -1107,13 +1324,22 @@ class Telegram:
             print(f"Telegram file error: {e}")
             return False
 
-    def set_commands(self, menu):
+    def set_commands(self, menu, chat_id=None):
+        """Command menu; with chat_id only for that chat (the owner gets the full menu)."""
+        body = {"commands": [{"command": c, "description": d} for c, d in menu]}
+        if chat_id:
+            body["scope"] = {"type": "chat", "chat_id": chat_id}
         try:
-            requests.post(f"{self.base}/setMyCommands",
-                          json={"commands": [{"command": c, "description": d} for c, d in menu]},
-                          timeout=15)
+            requests.post(f"{self.base}/setMyCommands", json=body, timeout=15)
         except requests.RequestException:
             pass
+
+    def username(self):
+        try:
+            r = requests.get(f"{self.base}/getMe", timeout=15).json()
+            return r["result"].get("username", "") if r.get("ok") else ""
+        except (requests.RequestException, ValueError, KeyError):
+            return ""
 
     def get_updates(self, offset, timeout):
         params = {"timeout": int(timeout), "allowed_updates": '["message"]'}
@@ -1253,11 +1479,26 @@ def run():
     nots = cfg.get("notifications", {})
     st = PrinterState(pr.get("name", "P1S"), L, nots.get("first_layer", True), nots.get("auto_photo", True))
     bot = Telegram(tgc["bot_token"], tgc["chat_id"])
+    viewers = Viewers(tgc["chat_id"], VIEWERS_PATH)
+    allow_requests = tgc.get("viewer_requests", True)
+    viewer_light = tgc.get("viewer_light_photo", True)
 
-    def send(msgs):
+    def send(msgs, owner_only=False):
+        """Automatic messages go to the owner and to all view-only users."""
         for m in msgs:
             print(f"{datetime.now():%H:%M:%S} → {m.splitlines()[0]}")
             bot.send(m)
+            if not owner_only:
+                for vid in viewers.ids():
+                    bot.send(m, vid)
+
+    def update(report):
+        greeted = st.greeted
+        msgs = st.update(report)
+        if not greeted and st.greeted and msgs:   # "PrintWatch connected": owner only, no restart spam
+            send(msgs[:1], owner_only=True)
+            msgs = msgs[1:]
+        send(msgs)
 
     client = make_mqtt_client(pr)
     client.reconnect_delay_set(min_delay=5, max_delay=120)
@@ -1280,7 +1521,7 @@ def run():
     def on_message(c, userdata, msg):
         try:
             report = json.loads(msg.payload.decode("utf-8", errors="ignore"))
-            send(st.update(report))
+            update(report)
         except Exception as e:  # one odd message must never stop the monitor
             print("Error handling printer message:", e)
 
@@ -1293,6 +1534,9 @@ def run():
                              lambda: grab_camera_jpeg(pr["ip"], pr["access_code"], with_info=True),
                              PrinterFiles(pr["ip"], pr["access_code"]))
     handler.notify = bot.send
+    handler.viewers = viewers
+    handler.viewer_light = viewer_light
+    handler.send_to = lambda chat_id, text: bot.send(text, chat_id)
     ffmpeg = find_ffmpeg()
     if ffmpeg:
         handler.convert = lambda data: avi_to_mp4(data, ffmpeg)
@@ -1317,9 +1561,12 @@ def run():
     client.connect_async(pr["ip"], 8883, keepalive=60)
     client.loop_start()
 
-    bot.set_commands(L("menu"))
+    bot.set_commands(L("viewer_menu"))                # everyone else: view-only menu
+    bot.set_commands(L("menu"), tgc["chat_id"])       # the owner: full menu
+    me = bot.username().lower()
     offset = bot.skip_old()
     print(f"PrintWatch LAN {__version__} running. Stop with Ctrl + C")
+    print(f"View-only users: {len(viewers.items)} (manage with /viewers)")
     print(f"Auto photo: {'on' if st.auto_photo else 'off'} (change with /autophoto)")
     print("Timelapse videos: sent as MP4" if ffmpeg else
           "Timelapse videos: sent as .avi (for playable MP4:  pip install imageio-ffmpeg)")
@@ -1334,23 +1581,39 @@ def run():
                 offset = u["update_id"] + 1
                 m = u.get("message") or {}
                 text = m.get("text", "")
-                if str(m.get("chat", {}).get("id")) != bot.chat_id or not text.startswith("/"):
-                    continue  # ignore everyone else: this bot can control a printer
+                chat = m.get("chat", {})
+                cid = str(chat.get("id", ""))
+                if not text.startswith("/"):
+                    continue
+                target = text.split()[0].partition("@")[2].lower()
+                if target and me and target != me:
+                    continue  # a command for another bot in the same group
+                role = viewers.role(cid)
+                if role is None:
+                    # strangers never get printer data; the owner may allow view-only access
+                    n = viewers.request(chat) if allow_requests else None
+                    if n:
+                        bot.send(L("req_user"), cid)
+                        bot.send(L("req_admin", who=viewers.pending[n]["name"], cmd=L("cmd_allow"), n=n))
+                        print(f"{datetime.now():%H:%M:%S} access request #{n} from a new chat")
+                    continue
+                handler.notify = lambda t, c=cid: bot.send(t, c)
                 try:
-                    reply, img = handler.handle(text)
+                    reply, img = handler.handle(text, role=role)
                 except Exception as e:
                     reply, img = f"Error: {e}", None
                 if isinstance(img, dict) and "video" in img:
-                    if not bot.send_video(img["video"], img["filename"], reply):
-                        bot.send_document(img["video"], img["filename"], reply)
+                    if not bot.send_video(img["video"], img["filename"], reply, cid):
+                        bot.send_document(img["video"], img["filename"], reply, cid)
                 elif isinstance(img, dict):
-                    bot.send_document(img["document"], img["filename"], reply)
+                    bot.send_document(img["document"], img["filename"], reply, cid)
                 elif img:
-                    bot.send_photo(img, reply)
+                    bot.send_photo(img, reply, cid)
                 else:
-                    bot.send(reply)
+                    bot.send(reply, cid)
                 first = re.sub(r"<[^>]+>", "", reply.splitlines()[0]) if reply else ""
-                print(f"{datetime.now():%H:%M:%S} command {text.split()[0]} → {first}")
+                who = "" if role == "admin" else " (viewer)"
+                print(f"{datetime.now():%H:%M:%S} command {text.split()[0]}{who} → {first}")
             send(st.tick())
             send_auto_photo()
     except KeyboardInterrupt:

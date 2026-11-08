@@ -358,6 +358,10 @@ class TestSpeedAndStatus(unittest.TestCase):
         self.h.handle("/atrums1@mybot")
         self.assertEqual(self.sent[-1]["print"]["param"], "1")
 
+    def test_trailing_punctuation_ignored(self):
+        self.assertIn("Standard (100%)", self.h.handle("/speed,")[0])
+        self.assertIn("Standard (100%)", self.h.handle("/speed!")[0])
+
     def test_latvian_alias(self):
         self.h.handle("/atrums 1")
         self.assertEqual(self.sent[-1]["print"]["param"], "1")
@@ -489,6 +493,163 @@ class TestDump(unittest.TestCase):
         self.assertIn("-60dBm", out)
         self.assertIn('"remain": 80', out)
         self.assertIn('"timelapse": "disable"', out)
+
+
+class TestViewers(unittest.TestCase):
+    """View-only users: they may look, never control the printer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "viewers.json"
+        self.st = fresh()
+        self.st.update({"print": {"gcode_state": "RUNNING", "subtask_name": "x", "mc_percent": 40,
+                                  "lights_report": [{"node": "chamber_light", "mode": "off"}]}}, T0)
+        self.sent, self.dm = [], []
+        self.h = pw.CommandHandler(self.st, lambda p: self.sent.append(p) or True,
+                                   lambda: b"\xff\xd8x\xff\xd9",
+                                   FakeFiles([("video_2026-11-01_20-00-00.avi", 1000)]))
+        self.h.viewers = pw.Viewers("1000", self.path)
+        self.h.send_to = lambda cid, text: self.dm.append((cid, text))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add_viewer(self, cid="2000", first_name="Anna", **kw):
+        n = self.h.viewers.request({"id": int(cid), "first_name": first_name, "type": "private", **kw})
+        self.h.handle(f"/allow{n}")
+        return n
+
+    def test_roles(self):
+        vw = self.h.viewers
+        self.assertEqual(vw.role("1000"), "admin")
+        self.assertIsNone(vw.role("2000"))
+        self.add_viewer()
+        self.assertEqual(vw.role(2000), "viewer")
+
+    def test_viewer_cannot_control(self):
+        for c in ("/light", "/gaisma", "/pause", "/resume", "/stop", "/confirmstop", "/stopja",
+                  "/speed3", "/speed 1", "/autophoto", "/viewers", "/allow1", "/remove1", "/nonemt1"):
+            text, att = self.h.handle(c, now_ts=100, role="viewer")
+            self.assertIn("View-only", text, c)
+            self.assertIsNone(att)
+        self.assertEqual(self.sent, [])            # nothing ever reached the printer
+        self.assertTrue(self.st.auto_photo)        # /autophoto did not toggle
+
+    def test_viewer_stop_confirm_cannot_use_owner_stop(self):
+        self.h.handle("/stop", now_ts=100)                       # owner asks to stop...
+        self.h.handle("/confirmstop", now_ts=110, role="viewer")  # ...a viewer must not confirm it
+        self.assertEqual(self.sent, [])
+
+    def test_viewer_can_look(self):
+        self.assertIn("printing", self.h.handle("/status", role="viewer")[0])
+        self.assertIn("printing", self.h.handle("/p1s", role="viewer")[0])
+        text, img = self.h.handle("/foto", role="viewer")
+        self.assertEqual(img[:2], b"\xff\xd8")
+        self.assertIn("light is off", text)
+        self.assertNotIn("/light", text)           # no hint to a command a viewer can't use
+        self.assertIn("Timelapse videos", self.h.handle("/timelapses", role="viewer")[0])
+        help_text = self.h.handle("/help", role="viewer")[0]
+        self.assertIn("view only", help_text)
+        self.assertNotIn("/stop", help_text)
+
+    def test_viewer_photo_switches_light_briefly(self):
+        self.h.viewer_light = True
+        self.h.sleep = lambda s: None
+        text, img = self.h.handle("/photo", now_ts=1000, role="viewer")
+        self.assertEqual(img[:2], b"\xff\xd8")
+        modes = [x["system"]["led_mode"] for x in self.sent]
+        self.assertEqual(modes, ["on", "off"])               # switched on, then always back off
+        self.assertIn("switched on for this photo", text)
+
+    def test_viewer_photo_light_is_rate_limited(self):
+        self.h.viewer_light = True
+        self.h.sleep = lambda s: None
+        self.h.handle("/photo", now_ts=1000, role="viewer")
+        text, img = self.h.handle("/photo", now_ts=1030, role="viewer")
+        self.assertEqual(len(self.sent), 2)                  # no new light commands
+        self.assertIn("next photo with light in 91 s", text)
+        self.h.handle("/photo", now_ts=1121, role="viewer")
+        self.assertEqual(len(self.sent), 4)
+
+    def test_viewer_photo_light_off_restored_even_if_camera_fails(self):
+        self.h.viewer_light = True
+        self.h.sleep = lambda s: None
+        def broken():
+            raise OSError("camera timeout")
+        self.h.grab_photo = broken
+        text, img = self.h.handle("/photo", now_ts=1000, role="viewer")
+        self.assertIn("camera timeout", text)
+        self.assertEqual([x["system"]["led_mode"] for x in self.sent], ["on", "off"])
+
+    def test_viewer_photo_light_not_touched_when_on_or_disabled(self):
+        self.h.sleep = lambda s: None
+        self.h.handle("/photo", now_ts=1000, role="viewer")  # feature off
+        self.h.viewer_light = True
+        self.st.update({"print": {"lights_report": [{"node": "chamber_light", "mode": "on"}]}}, T0)
+        self.h.handle("/photo", now_ts=1000, role="viewer")  # light already on
+        self.h.handle("/photo", now_ts=1000)                 # owner photo never switches the light
+        self.assertEqual(self.sent, [])
+
+    def test_viewer_status_hides_auto_photo(self):
+        self.assertIn("Auto photo", self.h.handle("/status")[0])
+        self.assertNotIn("Auto photo", self.h.handle("/status", role="viewer")[0])
+
+    def test_request_allow_and_welcome(self):
+        vw = self.h.viewers
+        n = vw.request({"id": 2000, "first_name": "Anna", "username": "anna", "type": "private"})
+        self.assertEqual(n, 1)
+        self.assertIsNone(vw.request({"id": 2000, "first_name": "Anna"}))   # asks once per run
+        text, _ = self.h.handle("/allow1")
+        self.assertIn("Anna (@anna) can now watch P1S", text)
+        self.assertEqual(self.dm[-1][0], "2000")
+        self.assertIn("view only", self.dm[-1][1])
+        self.assertIn("Unknown request", self.h.handle("/allow1")[0])        # used up
+
+    def test_owner_is_never_a_viewer(self):
+        self.assertIsNone(self.h.viewers.request({"id": 1000, "first_name": "Me"}))
+
+    def test_saved_and_reloaded(self):
+        self.add_viewer("2000", "Anna")
+        self.add_viewer("-1001234", None, title="Family", type="group")    # a group works too
+        again = pw.Viewers("1000", self.path)
+        self.assertEqual(again.ids(), ["2000", "-1001234"])
+        self.assertIn("[group]", again.items[1]["name"])
+
+    def test_list_and_remove(self):
+        self.assertIn("No view-only users", self.h.handle("/viewers")[0])
+        self.add_viewer("2000", "Anna")
+        self.add_viewer("3000", "Ben")
+        text = self.h.handle("/viewers")[0]
+        self.assertIn("1. Anna – remove: /remove1", text)
+        self.assertIn("2. Ben", text)
+        text = self.h.handle("/remove1")[0]
+        self.assertIn("Anna can no longer", text)
+        self.assertEqual(self.dm[-1], ("2000", "🔒 Your access to P1S has been removed."))
+        self.assertEqual(pw.Viewers("1000", self.path).ids(), ["3000"])
+        self.assertIn("Unknown viewer", self.h.handle("/remove5")[0])
+        # removed person may ask again
+        self.assertIsNotNone(self.h.viewers.request({"id": 2000, "first_name": "Anna"}))
+
+    def test_max_viewers(self):
+        for i in range(pw.MAX_VIEWERS):
+            self.add_viewer(str(5000 + i), f"U{i}")
+        n = self.h.viewers.request({"id": 9999, "first_name": "Late"})
+        self.assertIn("maximum", self.h.handle(f"/allow{n}")[0])
+        self.assertEqual(len(self.h.viewers.items), pw.MAX_VIEWERS)
+
+    def test_names_are_html_safe(self):
+        n = self.h.viewers.request({"id": 2000, "first_name": "<b>x</b>"})
+        self.assertNotIn("<b>x", self.h.viewers.pending[n]["name"])
+
+    def test_latvian_viewer(self):
+        self.st.L = pw.Lang("lv")
+        self.assertIn("Tikai skatīšanās", self.h.handle("/gaisma", role="viewer")[0])
+        self.add_viewer()
+        self.assertIn("noņemt: /nonemt1", self.h.handle("/skatitaji")[0])
+
+    def test_broken_file_is_ignored(self):
+        self.path.write_text("not json")
+        self.assertEqual(pw.Viewers("1000", self.path).ids(), [])
 
 
 class TestConfig(unittest.TestCase):

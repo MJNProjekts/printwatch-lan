@@ -3,7 +3,7 @@
 Telegram paziņojumi, kameras attēli un attālināta vadība Bambu Lab P1/A1 printeriem **LAN-only režīmā**.
 Bez Bambu mākoņa un bez Home Assistant: dators sazinās ar printeri vietējā tīklā un sūta ziņas uz **tavu** Telegram botu.
 
-> Publiska beta versija (v0.3.1-beta). Pārbaudīts ar **P1S**. Nav saistīts ar Bambu Lab.
+> Publiska beta versija (v0.4.0-beta). Pārbaudīts ar **P1S**. Nav saistīts ar Bambu Lab.
 
 Pilna dokumentācija angliski: [README.md](README.md)
 
@@ -31,6 +31,21 @@ Chat ID vednis noteiks automātiski, kad botā nospiedīsi **Start**.
 
 Darbojas arī angļu nosaukumi (`/status`, `/photo`, `/light` ...).
 
+## Skatītāji (ģimene, draugi, grupa)
+
+Citi var sekot drukām, bet nevar vadīt printeri. Skatītājs:
+- saņem automātiskās ziņas (sākta, pirmais slānis, pauze, kļūda, pabeigta), **bet ne automātiskos foto**
+- var lietot `/p1s`, `/foto`, `/video`, `/videos`
+- **nevar** lietot `/gaisma`, `/pauze`, `/turpinat`, `/stop`, `/atrums`, `/autofoto`, `/skatitaji`
+
+Kā pievienot:
+1. Cilvēks Telegram atver tavu botu un nospiež **Start**.
+2. Tev atnāk `👤 Piekļuves pieprasījums: ...` ar komandu, piem., `/atlaut1`. Pieskaries tai.
+3. Skatītājs saņem sveicienu ar savām komandām.
+
+`/skatitaji` rāda sarakstu un noņemšanas komandas (`/nonemt1`). Līdz 10 skatītājiem. Der arī Telegram **grupa**.
+Skatītāji glabājas `viewers.json` (nevis `config.json`).
+
 ## Palīdzība: AMS lietotāji
 
 PrintWatch tiek izstrādāts uz P1S **bez AMS**. Ja tev ir AMS vai A1 / P1P, palaid
@@ -40,4 +55,4 @@ bet pirms sūtīšanas fails tomēr jāpārskata.
 
 ## Drošība
 
-Bots atbild **tikai tavam** chat ID. `config.json` satur Access Code un bota tokenu, **nekad to nepublicē**.
+Printeri vadīt var **tikai tavs** chat ID; skatītāji var tikai skatīties, svešie nesaņem neko. `config.json` satur Access Code un bota tokenu, **nekad to nepublicē**.

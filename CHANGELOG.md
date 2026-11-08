@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0-beta (2026-11-08)
+
+### Added
+- **View-only users**: family, friends or a Telegram group can follow your prints without control.
+  - They get the automatic messages (not the automatic photos) and can use `/status`, `/photo`,
+    `/timelapse`, `/timelapses`. Every control command answers "View-only access".
+  - Adding someone: they press **Start** in the bot, you get an access request and tap `/allow1`
+    (`/atlaut1`). `/viewers` (`/skatitaji`) lists them with `/remove1` (`/nonemt1`). Up to 10.
+  - Stored in `viewers.json` (gitignored); `config.json` is never rewritten.
+  - A viewer's `/photo` switches the chamber light on for the snapshot when it is off, then off
+    again, at most once per 2 minutes. Turn off with `"viewer_light_photo": false` in the `telegram` section.
+  - `"viewer_requests": false` in the `telegram` config section turns access requests off.
+- Command menu: the owner sees all commands, everyone else only the view-only ones.
+
+### Changed
+- Strangers still get no printer data. Their first command now sends the owner one access request
+  per run instead of being silently ignored.
+- The "PrintWatch connected" message at start goes to the owner only.
+- Commands addressed to another bot in a group (`/status@OtherBot`) are ignored.
+- Punctuation typed right after a command (`/viewers,`) no longer opens the help text.
+
 ## 0.3.1-beta (2026-11-01)
 
 ### Added
